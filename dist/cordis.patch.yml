@@ -1,0 +1,9 @@
+# dsh-yunxiao: 轻量云效工作台
+- insert:
+    - id: dsh-yunxiao
+      name: 'dsh-yunxiao'
+      config:
+        dataFile: './dsh-yunxiao.data.json'
+        apiBaseUrl: 'https://openapi-rdc.aliyuncs.com'
+        timeoutMs: 45000
+        cacheMaxItems: 100

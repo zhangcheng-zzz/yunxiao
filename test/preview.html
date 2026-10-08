@@ -1,0 +1,103 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>dsh-yunxiao preview</title>
+  <style>
+    body { margin: 0; min-height: 100vh; color: #dbe7f5; background: radial-gradient(circle at 25% 20%, #1d3557, #07111f 55%); font-family: system-ui, sans-serif; }
+    .host { max-width: 720px; margin: 0 540px 0 auto; padding: 72px 24px; }
+    .host h1 { font-size: 42px; margin: 0 0 12px; }
+    .host p { color: #91a4bd; }
+  </style>
+  <script>
+    window.__pageErrors = [];
+    window.onerror = function (msg, src, line, col) { window.__pageErrors.push(msg + ' @' + line + ':' + col); };
+    window.addEventListener('unhandledrejection', function (e) { window.__pageErrors.push(String(e.reason)); });
+  </script>
+  <script>
+    window.__DYX_NOTIFICATION_MINUTE_MS__ = 100;
+    window.__dsh_native_notification_bridge__ = true;
+    window.__previewNotifications = [];
+    class PreviewNotification {
+      static permission = 'granted';
+      static requestPermission() { return Promise.resolve('granted'); }
+      constructor(title, options) { this.title = title; this.options = options; window.__previewNotifications.push({ title, options }); }
+      close() {}
+    }
+    Object.defineProperty(window, 'Notification', { configurable: true, value: PreviewNotification });
+    const previewState = {
+      selectedAccountId: 'account-1',
+      accounts: [{ id: 'account-1', name: '研发账号', organizationId: 'org-demo', remark: '本地预览数据', hasToken: true, selectedProject: { id: 'project-1', name: '研发中台' }, workspace: { id: 'ws-1', title: 'demo-app', path: '~/code/demo-app' }, defectNotification: { enabled: true, assignedToId: 'u1', assignedToName: '张三', intervalMinutes: 5, targetStatuses: [{ id: 'pending', name: '待确认' }, { id: 'reopened', name: '再次打开' }] }, createdAt: '2026-08-24T01:00:00Z', updatedAt: '2026-08-24T01:00:00Z' }],
+      dataFile: 'D:/preview/dsh-yunxiao.data.json'
+    };
+    const defects = [{ projectId: 'project-1', id: 'bug-1', serialNumber: 'BUG-128', subject: '登录页偶发验证码刷新失败', statusId: 'doing', statusName: '处理中', assignedToId: 'u1', assignedToName: '张三', creatorName: '李四', sprintName: 'Sprint 18', priority: 'P1', severity: '严重', gmtCreate: '2026-08-24T08:00:00Z', gmtModified: '2026-08-24T08:25:00Z' }, { projectId: 'project-1', id: 'bug-2', serialNumber: 'BUG-127', subject: '导出报表的日期时区不正确', statusId: 'pending', statusName: '待确认', assignedToId: 'u2', assignedToName: '王五', priority: 'P2', severity: '一般', sprintName: 'Sprint 18', gmtCreate: '2026-08-23T12:00:00Z', gmtModified: '2026-08-23T13:00:00Z' }, { projectId: 'project-1', id: 'bug-3', serialNumber: 'BUG-126', subject: '已修复缺陷重新出现', statusId: 'reopened', statusName: '再次打开', assignedToId: 'u1', assignedToName: '张三', priority: 'P1', severity: '严重', sprintName: 'Sprint 18', gmtCreate: '2026-08-22T10:00:00Z', gmtModified: '2026-08-24T09:00:00Z' }, { projectId: 'project-1', id: 'bug-4', serialNumber: 'BUG-125', subject: '深色模式下卡片边框对比度不足', statusId: 'pending', statusName: '待确认', assignedToId: 'u1', assignedToName: '张三', priority: 'P3', severity: '轻微', sprintName: 'Sprint 19', gmtCreate: '2026-08-21T15:30:00Z', gmtModified: '2026-08-21T15:30:00Z' }, { projectId: 'project-1', id: 'bug-5', serialNumber: 'BUG-124', subject: '附件列表在弱网环境加载超时', statusId: 'doing', statusName: '处理中', assignedToId: 'u2', assignedToName: '王五', priority: 'P2', severity: '一般', sprintName: 'Sprint 18', gmtCreate: '2026-08-20T09:10:00Z', gmtModified: '2026-08-23T18:40:00Z' }, { projectId: 'project-1', id: 'bug-6', serialNumber: 'BUG-123', subject: '搜索结果分页计数与总数不一致', statusId: 'done', statusName: '已完成', assignedToId: 'u1', assignedToName: '张三', priority: 'P2', severity: '一般', sprintName: 'Sprint 17', gmtCreate: '2026-08-18T11:00:00Z', gmtModified: '2026-08-19T16:20:00Z' }];
+    const statuses = [{ id: 'pending', name: '待确认' }, { id: 'doing', name: '处理中' }, { id: 'reopened', name: '再次打开' }, { id: 'done', name: '已完成' }];
+    const defectComments = [{ id: 'c1', userName: '李四', content: '<p>复现步骤：退出登录后停留 5 分钟，再点击“获取验证码”，约 30% 概率不刷新。</p>', contentFormat: 'RICHTEXT', gmtCreate: '2026-08-24T06:50:00Z' }, { id: 'c2', userName: '张三', content: '<p>已定位到缓存键冲突，修复中。</p>', contentFormat: 'RICHTEXT', gmtCreate: '2026-08-24T07:30:00Z' }];
+    const pipelines = [{ id: '1001', name: '主站生产发布', status: 'SUCCESS', updateTime: 1787531400000 }, { id: '1002', name: 'API 集成测试', status: 'RUNNING', updateTime: 1787531700000 }, { id: '1003', name: '前端构建产物上传', status: 'FAILED', updateTime: 1787530200000 }, { id: '1004', name: '夜间回归测试', status: 'SUCCESS', updateTime: 1787445000000 }, { id: '1005', name: '镜像同步与清理', status: 'SUCCESS', updateTime: 1787358600000 }];
+    window.fetch = async (_url, options) => {
+      const request = JSON.parse(options.body || '{}');
+      const method = request.method;
+      let data = {};
+      if (method === 'state.get') data = previewState;
+      else if (method === 'projects.list') data = { items: [{ id: 'project-1', name: '研发中台', selected: true }, { id: 'project-2', name: '移动客户端' }], stale: false };
+      else if (method === 'defects.list') {
+        const args = request.args || {};
+        const items = defects.filter(item => (!args.statusId || item.statusId === args.statusId) && (!args.assignedToId || item.assignedToId === args.assignedToId));
+        data = { items, total: items.length, page: 1, pageSize: 5, stale: false };
+      }
+      else if (method === 'defect.members') data = [{ id: 'u1', name: '张三' }, { id: 'u2', name: '王五' }];
+      else if (method === 'defect.statusOptions') data = { items: statuses };
+      else if (method === 'defect.notification.assignees') data = [{ id: 'u1', name: '张三' }, { id: 'u2', name: '王五' }];
+      else if (method === 'defect.notification.scan') {
+        const eligible = defects.filter(item => ['待确认', '再次打开'].includes(item.statusName) && (!request.args.assignedToId || item.assignedToId === request.args.assignedToId));
+        data = { items: eligible, ids: eligible.map(item => item.id), statuses: previewState.accounts[0].defectNotification.targetStatuses, assignees: [{ id: 'u1', name: '张三' }, { id: 'u2', name: '王五' }], checkedAt: new Date().toISOString(), page: 1, pageSize: 100, queryCount: 2 };
+      }
+      else if (method === 'system.notification.show') data = { supported: true, accepted: true, channel: 'preview-native' };
+      else if (method === 'defect.notification.settings.update') {
+        previewState.accounts[0].defectNotification = { enabled: Boolean(request.args.enabled), assignedToId: request.args.assignedToId || '', assignedToName: request.args.assignedToName || '', intervalMinutes: Number(request.args.intervalMinutes) || 5, targetStatuses: request.args.targetStatuses || previewState.accounts[0].defectNotification.targetStatuses };
+        data = previewState.accounts[0].defectNotification;
+      }
+      else if (method === 'defect.get') {
+        const defect = defects.find(item => item.id === request.args.defectId) || defects[0];
+        data = { defect, description: '<p><strong>现象：</strong>登录页偶发验证码不刷新，输入后提示“验证码已过期”。</p><p><strong>复现步骤：</strong></p><ol><li>退出登录后停留在登录页约 5 分钟；</li><li>点击“获取验证码”；</li><li>约 30% 概率图片验证码不刷新。</li></ol><p><strong>预期：</strong>每次点击都应获取新的验证码。</p>', descriptionFormat: 'RICHTEXT', statuses, comments: defectComments, attachments: [{ fileId: 'file-1', fileName: '登录页报错截图.png', suffix: '.png', size: 102400, url: 'https://example.com/expired/file-1.png', creatorName: '张三', gmtCreate: '2026-08-24T07:00:00Z' }, { fileId: 'file-2', fileName: '网关响应日志.log', suffix: '.log', size: 20480, url: 'https://example.com/expired/file-2.log', creatorName: '李四', gmtCreate: '2026-08-24T07:10:00Z' }], warning: '' };
+      }
+      else if (method === 'defect.comment.create') {
+        const created = { id: 'c' + (defectComments.length + 1), userName: '当前账号', content: request.args.content, contentFormat: 'MARKDOWN', gmtCreate: new Date().toISOString() };
+        defectComments.unshift(created);
+        data = { id: created.id, projectId: 'project-1', defectId: request.args.defectId };
+      }
+      else if (method === 'defect.attachment.link') data = { fileId: request.args.fileId, fileName: '刷新后的下载地址', suffix: '', size: 0, url: 'https://example.com/fresh/' + request.args.fileId };
+      else if (method === 'defect.statuses') data = statuses;
+      else if (method === 'defect.status.update') {
+        const item = defects.find(entry => entry.id === request.args.defectId);
+        const status = statuses.find(entry => entry.id === request.args.statusId);
+        if (item && status) { item.statusId = status.id; item.statusName = status.name; }
+        data = item;
+      }
+      else if (method === 'workspaces.list') data = { items: [{ id: 'ws-1', title: 'demo-app', path: '/Users/demo/code/demo-app' }, { id: 'ws-2', title: 'docs-site', path: '/Users/demo/code/docs-site' }] };
+      else if (method === 'pipelines.list') data = { items: pipelines, total: pipelines.length, page: 1, pageSize: 5, stale: false };
+      else if (method === 'pipeline.get') data = { pipeline: pipelines[0], envName: '生产环境', sources: [{ sourceId: 's1', name: '主仓库', type: 'Codeup', repo: 'https://codeup.aliyun.com/demo/app.git', defaultBranch: 'main', isBranchMode: false }] };
+      else if (method === 'pipeline.runs') data = { items: [{ pipelineId: '1001', pipelineRunId: '501', status: 'SUCCESS', startTime: '2026-08-24T07:00:00Z', endTime: '2026-08-24T07:08:00Z' }], total: 1, page: 1, pageSize: 10 };
+      else if (method === 'pipeline.branches') data = [{ sourceId: 's1', name: '主仓库', type: 'Codeup', repo: 'https://codeup.aliyun.com/demo/app.git', defaultBranch: 'main', isBranchMode: false, branches: ['main', 'release/2026.08'], warning: '' }];
+      else if (method === 'pipeline.run.create') data = { pipelineId: request.args.pipelineId, pipelineRunId: 'preview-501' };
+      return new Response(JSON.stringify({ ok: true, data }), { status: 200, headers: { 'content-type': 'application/json' } });
+    };
+    window.__ModuleLoader__ = { load(definition) { const plugin = definition.factory(() => ({})); plugin.apply({ effect(effect) { effect(); } }); } };
+  </script>
+</head>
+<body>
+  <main class="host"><h1>DeepSeek Harness</h1><p>云效插件本地视觉预览。工作台使用右侧独立栏，不遮挡聊天区域。</p></main>
+  <script>
+    // 预览辅助：URL hash 指定初始页签，如 preview.html#流水线
+    window.addEventListener('load', function () {
+      var tab = decodeURIComponent(location.hash.slice(1));
+      if (!tab) return;
+      setTimeout(function () {
+        document.querySelectorAll('.dyx-nav button').forEach(function (b) { if (b.textContent.trim() === tab) b.click(); });
+      }, 300);
+    });
+  </script>
+  <script src="../dist/client.js"></script>
+</body>
+</html>
