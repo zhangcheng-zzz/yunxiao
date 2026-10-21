@@ -99,6 +99,87 @@
       const [assignedToId, assignedToName] = owners[i % 2];
       defects.push({ projectId: 'project-1', id: 'bug-x' + i, serialNumber: 'BUG-' + (100 + i), subject: '示例缺陷 ' + (i + 1) + '：模块回归中发现的功能异常，需要跟进修复', statusId, statusName, assignedToId, assignedToName, priority: i % 3 === 0 ? 'P1' : 'P2', severity: i % 3 === 0 ? '严重' : '一般', sprintName: 'Sprint 1' + (i % 8), gmtCreate: '2026-08-2' + (i % 8) + 'T0' + (i % 9) + ':30:00Z', gmtModified: '2026-08-2' + (i % 8) + 'T1' + (i % 9) + ':30:00Z' });
     }
+    // —— 规则引擎预览数据：处理规则 + 运行台账 ————————————————————————————
+    const minutesAgoIso = (n) => new Date(Date.now() - n * 60_000).toISOString();
+    const previewPolicies = [
+      {
+        id: 'p1', name: '样式 / 缺字段自动修复', enabled: true, order: 0,
+        scope: { accountId: '', projectId: '' },
+        trigger: { statusKinds: ['pending', 'reopened'], assigneeId: '', pollMinutes: 5, backfill: false },
+        match: { keywordsAny: ['样式', '错位', '字体', '颜色', '间距', '字段缺失', '缺少字段', '未显示', '不展示', '文案'], keywordsNone: ['支付', '结算', '退款'], priorityCeiling: 'P2', typeAny: [], labelAny: [] },
+        mode: 'auto-submit',
+        instructions: '只改前端展示与字段映射层，不改接口契约；缺失字段优先从现有接口返回/DTO 中取，取不到则以 needs-human 报告；样式遵循项目现有 UI 规范；修复说明附修改前后对照。',
+        agent: { preset: '', permissionPreset: 'auto-fix', model: '', maxMinutes: 30 },
+        submit: { repoId: '10001', repoPath: 'demo-org/demo-web', baseBranch: 'develop', branchPattern: 'fix/{serial}-{slug}', push: true, createMr: true, mrTarget: 'develop', mrTitle: 'fix({serial}): {subject}', pipelineId: '', verifyCommands: ['pnpm lint', 'pnpm typecheck'], maxChangedFiles: 30, forbiddenPaths: ['**/payment/**', '.github/**'] },
+        writeback: { comment: true, statusOnSuccess: '已完成', statusOnConfirm: '处理中', statusOnFailure: '', assigneeOnFailure: '' },
+        concurrency: 2, lastScanAt: minutesAgoIso(2), createdAt: daysAgo(3), updatedAt: daysAgo(1)
+      },
+      {
+        id: 'p2', name: 'C 端后台逻辑分析确认', enabled: true, order: 1,
+        scope: { accountId: '', projectId: '' },
+        trigger: { statusKinds: ['pending'], assigneeId: '', pollMinutes: 5, backfill: true },
+        match: { keywordsAny: ['接口', '数据不对', '报错', '500', '逻辑', '状态流转', '计算', '超时'], keywordsNone: [], priorityCeiling: '', typeAny: ['缺陷'], labelAny: [] },
+        mode: 'analyze-confirm',
+        instructions: '本次只读诊断：定位根因、给出修复方案（含涉及文件清单）与风险影响面，不改任何代码；结论需包含验证思路。',
+        agent: { preset: '', permissionPreset: '', model: '', maxMinutes: 30 },
+        submit: { repoId: '10001', repoPath: 'demo-org/demo-web', baseBranch: 'develop', branchPattern: 'fix/{serial}-{slug}', push: true, createMr: true, mrTarget: 'develop', mrTitle: 'fix({serial}): {subject}', pipelineId: '', verifyCommands: ['pnpm lint'], maxChangedFiles: 30, forbiddenPaths: [] },
+        writeback: { comment: true, statusOnSuccess: '已完成', statusOnConfirm: '处理中', statusOnFailure: '', assigneeOnFailure: '' },
+        concurrency: 2, lastScanAt: minutesAgoIso(2), createdAt: daysAgo(2), updatedAt: daysAgo(2)
+      }
+    ];
+    const previewRuns = [
+      {
+        id: 'r-101', policyId: 'p1', policyName: '样式 / 缺字段自动修复', accountId: 'account-1', projectId: 'project-1', workspaceId: 'ws-1',
+        defectId: 'bug-4', serial: 'BUG-125', subject: '深色模式下卡片边框对比度不足', mode: 'auto-submit', status: 'succeeded',
+        sessionId: 'yunxiao-r-101', fingerprint: 'pending:2026-08-21T15:30:00Z', trigger: 'scan',
+        steps: [
+          { name: 'fetching', status: 'ok', at: minutesAgoIso(48), detail: '拉取缺陷详情' },
+          { name: 'classifying', status: 'ok', at: minutesAgoIso(47), detail: '命中规则：样式' },
+          { name: 'agent-running', status: 'ok', at: minutesAgoIso(46), detail: '智能体实施修复' },
+          { name: 'submitting', status: 'ok', at: minutesAgoIso(31), detail: '创建合并请求' },
+          { name: 'writeback', status: 'ok', at: minutesAgoIso(30), detail: '回写缺陷' },
+          { name: 'succeeded', status: 'ok', at: minutesAgoIso(30), detail: '修复完成并通过验证' }
+        ],
+        log: [{ t: '12s', m: '定位到 .dyx-card 边框色值未跟随深色变量' }, { t: '90s', m: 'pnpm lint / typecheck 通过，已推送 fix/bug-125-card-border' }],
+        result: {
+          outcome: 'fixed', summary: '深色变量补齐卡片边框色值，两处截图对照见评论', rootCause: '边框使用固定色值 #e5e9f2，未读取 --dyx-line 深色变量', plan: '', risk: '低，仅展示层',
+          branch: 'fix/bug-125-card-border', commits: ['4d21e77'], changedFiles: ['src/styles/dark.css', 'src/components/Card.vue'],
+          mrUrl: 'https://codeup.aliyun.com/demo/app/change/771', mrId: '771', pipelineRunId: '',
+          verify: [{ command: 'pnpm lint', ok: true, output: '' }, { command: 'pnpm typecheck', ok: true, output: '' }]
+        },
+        error: '', startedAt: minutesAgoIso(48), endedAt: minutesAgoIso(30), durationMs: 1080000
+      },
+      {
+        id: 'r-102', policyId: 'p2', policyName: 'C 端后台逻辑分析确认', accountId: 'account-1', projectId: 'project-1', workspaceId: 'ws-1',
+        defectId: 'bug-2', serial: 'BUG-127', subject: '导出报表的日期时区不正确', mode: 'analyze-confirm', status: 'awaiting-confirm',
+        sessionId: 'yunxiao-r-102', fingerprint: 'pending:2026-08-23T13:00:00Z', trigger: 'scan',
+        steps: [
+          { name: 'fetching', status: 'ok', at: minutesAgoIso(15), detail: '拉取缺陷详情' },
+          { name: 'classifying', status: 'ok', at: minutesAgoIso(14), detail: '命中规则：接口' },
+          { name: 'agent-running', status: 'ok', at: minutesAgoIso(13), detail: '智能体只读诊断' },
+          { name: 'awaiting-confirm', status: 'ok', at: minutesAgoIso(9), detail: '分析完成，等待人工确认' }
+        ],
+        log: [{ t: '40s', m: '导出链路使用 toISOString 但未指定时区' }, { t: '3m', m: '已评论分析结论并流转到「处理中」' }],
+        result: {
+          outcome: 'analyzed', summary: '导出服务把本地时间按 UTC 序列化，导致跨时区日期偏移一天', rootCause: 'ReportExporter.assemble() 用 toISOString() 直接格式化业务日期', plan: '统一改为按项目时区格式化（dayjs.tz），涉及 2 个文件；补一条时区回归用例', risk: '中：影响所有导出模板的时间列，需回归历史导出',
+          branch: '', commits: [], changedFiles: ['server/export/ReportExporter.ts', 'server/export/timezone.ts'], mrUrl: '', mrId: '', pipelineRunId: '', verify: []
+        },
+        error: '', startedAt: minutesAgoIso(15), endedAt: '', durationMs: 0
+      },
+      {
+        id: 'r-103', policyId: 'p1', policyName: '样式 / 缺字段自动修复', accountId: 'account-1', projectId: 'project-1', workspaceId: 'ws-1',
+        defectId: 'bug-2', serial: 'BUG-127', subject: '导出报表的日期时区不正确', mode: 'auto-submit', status: 'failed',
+        sessionId: 'yunxiao-r-103', fingerprint: 'pending:2026-08-23T13:00:00Z', trigger: 'retry',
+        steps: [
+          { name: 'fetching', status: 'ok', at: minutesAgoIso(120), detail: '拉取缺陷详情' },
+          { name: 'agent-running', status: 'ok', at: minutesAgoIso(119), detail: '智能体实施修复' },
+          { name: 'failed', status: 'ok', at: minutesAgoIso(100), detail: 'pnpm typecheck 未通过' }
+        ],
+        log: [{ t: '2m', m: 'pnpm typecheck 报 3 个类型错误' }],
+        result: { outcome: 'fixed', summary: '', rootCause: '', plan: '', risk: '', branch: 'fix/bug-127-tz', commits: ['77b0e19'], changedFiles: ['server/export/ReportExporter.ts'], mrUrl: '', mrId: '', pipelineRunId: '', verify: [{ command: 'pnpm lint', ok: true, output: '' }, { command: 'pnpm typecheck', ok: false, output: 'error TS2345: Argument of type…' }] },
+        error: '验证命令未通过：pnpm typecheck', startedAt: minutesAgoIso(120), endedAt: minutesAgoIso(100), durationMs: 1200000
+      }
+    ];
     window.fetch = async (_url, options) => {
       const request = JSON.parse(options.body || '{}');
       const method = request.method;
@@ -159,6 +240,66 @@
     else if (method === 'tests.plans.list') data = paginate(testPlans, request.args);
     else if (method === 'packages.repos.list') data = paginate(packageRepos, request.args);
     else if (method === 'flows.list') data = { items: previewFlows };
+    // —— 规则引擎：policies / runs / engine 的预览数据 ——————————————————
+    else if (method === 'policies.list') data = { items: previewPolicies };
+    else if (method === 'policies.save') {
+      const policy = request.args.policy || {};
+      const now = new Date().toISOString();
+      const index = previewPolicies.findIndex(item => item.id === policy.id);
+      if (index >= 0) Object.assign(previewPolicies[index], policy, { updatedAt: now });
+      else previewPolicies.push(Object.assign({ id: 'p' + (previewPolicies.length + 1), order: previewPolicies.length, createdAt: now }, policy, { updatedAt: now }));
+      data = policy;
+    }
+    else if (method === 'policies.delete') {
+      const index = previewPolicies.findIndex(item => item.id === request.args.policyId);
+      if (index >= 0) previewPolicies.splice(index, 1);
+      data = { ok: true };
+    }
+    else if (method === 'policies.reorder') {
+      const byId = new Map(previewPolicies.map(item => [item.id, item]));
+      previewPolicies.length = 0;
+      (request.args.ids || []).forEach(id => { const item = byId.get(id); if (item) previewPolicies.push(item); });
+      data = { items: previewPolicies };
+    }
+    else if (method === 'policies.test') {
+      const candidates = defects.filter(item => ['待确认', '再次打开'].includes(item.statusName)).slice(0, 6);
+      const policy = request.args.policy || {};
+      const any = (policy.match && policy.match.keywordsAny) || [];
+      const none = (policy.match && policy.match.keywordsNone) || [];
+      data = {
+        items: candidates.map(item => {
+          const text = item.subject;
+          const blocked = none.some(word => text.includes(word));
+          const hit = !blocked && any.some(word => text.includes(word));
+          return { id: item.id, serialNumber: item.serialNumber, subject: item.subject, statusName: item.statusName, priority: item.priority, assignedToName: item.assignedToName, matched: hit, reason: blocked ? '命中排除关键词' : hit ? '命中包含关键词' : '未命中任何包含关键词', mode: policy.mode || 'analyze-confirm' };
+        }),
+        matched: candidates.filter(item => any.some(word => item.subject.includes(word))).length,
+        total: candidates.length
+      };
+    }
+    else if (method === 'runs.list') {
+      const status = (request.args || {}).status || '';
+      data = { items: previewRuns.filter(item => !status || item.status === status) };
+    }
+    else if (method === 'runs.get') data = previewRuns.find(item => item.id === request.args.runId) || previewRuns[0];
+    else if (method === 'runs.cancel' || method === 'runs.retry') data = { ok: true };
+    else if (method === 'runs.confirm') {
+      const run = previewRuns.find(item => item.id === request.args.runId);
+      if (run && request.args.decision === 'approve') {
+        run.status = 'agent-running';
+        setTimeout(() => { run.status = 'succeeded'; run.result = Object.assign({}, run.result, { outcome: 'fixed', summary: '已按批准的方案补齐字段映射并修复样式', branch: 'fix/BUG-127-field-map', commits: ['9f31c2a'], changedFiles: ['src/pages/report/DateField.vue'], verify: [{ command: 'pnpm lint', ok: true }, { command: 'pnpm typecheck', ok: true }], mrUrl: 'https://codeup.aliyun.com/demo/app/change/778', mrId: '778' }); }, 3000);
+      } else if (run && request.args.decision === 'handoff') {
+        run.status = 'needs-human';
+        run.result = Object.assign({}, run.result, { outcome: 'needs-human' });
+      } else if (run) {
+        run.status = 'canceled';
+      }
+      data = { ok: true, status: run && run.status };
+    }
+    else if (method === 'engine.status') {
+      data = { available: true, scanning: false, queued: 0, lastScanAt: new Date(Date.now() - 2 * 60_000).toISOString(), lastScanError: '', active: [] };
+    }
+    else if (method === 'engine.scanNow') data = { ok: true, at: new Date().toISOString(), results: [{ policyId: 'p1', name: '样式 / 缺字段自动修复', scanned: 4, matched: 1, snapshotted: 0 }] };
     else if (method === 'flows.save') {
       const flow = request.args.flow || {};
       const index = previewFlows.findIndex(item => item.id === flow.id);

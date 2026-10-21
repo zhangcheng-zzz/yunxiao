@@ -822,6 +822,28 @@ function createJsonStore(fileName, cacheMaxItems) {
     });
   }
 
+  // 规则的生效范围：scope 为空时跟随当前账号/项目；工作区绑定取项目设置。
+  async function resolvePolicyScope(policy) {
+    const state = await load();
+    const scope = policy?.scope && typeof policy.scope === "object" ? policy.scope : {};
+    const wantedAccount = cleanText(scope.accountId, 100) || state.selectedAccountId;
+    const account = state.accounts.find((item) => item.id === wantedAccount);
+    if (!account) throw new YunxiaoError("规则绑定的云效账号不存在或未配置", 422);
+    if (!cleanText(account.organizationId, 128) || !cleanText(account.token)) {
+      throw new YunxiaoError("规则绑定的账号缺少组织 ID 或个人访问令牌", 422);
+    }
+    const projectId = cleanText(scope.projectId, 128) || cleanText(account.selectedProject?.id, 128);
+    if (!projectId) throw new YunxiaoError("规则绑定的账号尚未选择项目", 422);
+    const projectSettings = account.projectSettings && typeof account.projectSettings === "object"
+      ? account.projectSettings[projectId]
+      : null;
+    return {
+      account,
+      projectId,
+      workspace: normalizeWorkspaceBinding(projectSettings?.workspace)
+    };
+  }
+
   return {
     absolutePath,
     load,
@@ -851,7 +873,1058 @@ function createJsonStore(fileName, cacheMaxItems) {
     getRun,
     saveRun,
     markSeen,
-    markSeenBatch
+    markSeenBatch,
+    resolvePolicyScope
+  };
+}
+
+// —— 规则引擎：宿主侧常驻执行器 ————————————————————————————————————————————
+// 轮询拉取缺陷 → 规则匹配 → 分级自治（auto-submit 全自动修复 / analyze-confirm 分析后确认 / notify 仅通知）。
+// 浏览器只做展示与裁决；引擎依赖 agents / agentPresets / permissionPresets / sessionTitle /
+// workspaceRegistry / attachments 六个宿主服务，任一缺失（profile 组成不同）时引擎保持停用，
+// RPC 返回「引擎不可用」，其余功能不受影响。
+const ENGINE_MAX_CONCURRENCY = 2;
+const ENGINE_COOLDOWN_MS = 30 * 60_000;
+const ENGINE_SCAN_PAGE_SIZE = 100;
+const ENGINE_IMAGE_LIMIT = 8;
+const ENGINE_PIPELINE_POLL_MS = 15_000;
+const ENGINE_PIPELINE_MAX_MS = 10 * 60_000;
+// 台账里这些终态在冷却期内不再重跑；snapshot / queued / unmatched 等过程态不拦。
+const ENGINE_SEEN_TERMINAL = new Set(["fixed", "needs-human", "not-a-bug", "cannot-reproduce", "blocked"]);
+
+class EngineCancel extends Error {
+  constructor(message = "运行已取消") {
+    super(message);
+    this.name = "EngineCancel";
+  }
+}
+
+function policyPriorityRank(value) {
+  const match = /P([0-3])/i.exec(String(value ?? ""));
+  return match ? Number(match[1]) : -1;
+}
+
+// 规则匹配：排除关键词 → 包含关键词 → 优先级上限 → 工作项类型，任一步不过即不命中。
+// match.labelAny 暂不参与判定（缺陷列表接口不返回标签），UI 中隐藏该输入。
+function policyMatches(policy, defect) {
+  const match = policy.match || {};
+  const haystack = `${defect.subject || ""}\n${defect.description || ""}`.toLowerCase();
+  for (const keyword of match.keywordsNone || []) {
+    if (haystack.includes(String(keyword).toLowerCase())) {
+      return { matched: false, reason: `命中排除关键词「${keyword}」` };
+    }
+  }
+  if ((match.keywordsAny || []).length) {
+    const hit = match.keywordsAny.find((keyword) => haystack.includes(String(keyword).toLowerCase()));
+    if (!hit) return { matched: false, reason: "未命中任何包含关键词" };
+  }
+  if (match.priorityCeiling) {
+    const ceiling = policyPriorityRank(match.priorityCeiling);
+    const actual = policyPriorityRank(defect.priority);
+    if (actual >= 0 && actual > ceiling) {
+      return { matched: false, reason: `优先级 ${defect.priority} 低于上限 ${match.priorityCeiling}` };
+    }
+  }
+  if ((match.typeAny || []).length && !match.typeAny.includes(defect.workitemType || "")) {
+    return { matched: false, reason: `工作项类型「${defect.workitemType || "未知"}」不在范围内` };
+  }
+  return { matched: true, reason: "命中规则" };
+}
+
+function policySlug(text) {
+  const ascii = String(text || "").toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 40);
+  return ascii || "defect";
+}
+
+function renderPolicyTemplate(template, vars) {
+  return String(template || "").replace(/\{(\w+)\}/g, (raw, key) => {
+    const value = vars[key];
+    return value === undefined || value === null ? raw : String(value);
+  });
+}
+
+// 仅用于 forbiddenPaths 这类"路径是否命中"的判断，支持 ** / * / ?。
+function globToRegExp(pattern) {
+  const escaped = String(pattern || "").trim()
+    .replace(/[.+^${}()|[\]\\]/g, "\\$&")
+    .replace(/\*\*/g, "\u0000")
+    .replace(/\*/g, "[^/]*")
+    .replace(/\u0000/g, ".*")
+    .replace(/\?/g, ".");
+  return new RegExp(`^${escaped}$`, "i");
+}
+
+function parseAgentOptions(raw) {
+  const text = cleanText(raw, 200);
+  if (!text) return undefined;
+  if (text.startsWith("{")) {
+    try {
+      const parsed = JSON.parse(text);
+      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) return parsed;
+    } catch {}
+  }
+  return { model: text };
+}
+
+function blankRun(fields = {}) {
+  return {
+    id: fields.id || randomUUID(),
+    policyId: fields.policyId || "",
+    policyName: fields.policyName || "",
+    accountId: "",
+    projectId: "",
+    workspaceId: "",
+    defectId: fields.defectId || "",
+    serial: fields.serial || "",
+    subject: fields.subject || "",
+    mode: fields.mode && POLICY_MODES.has(fields.mode) ? fields.mode : "analyze-confirm",
+    status: fields.status || "queued",
+    sessionId: "",
+    fingerprint: fields.fingerprint || "",
+    trigger: fields.trigger || "scan",
+    steps: [],
+    log: [],
+    result: normalizeRunResult(null),
+    error: "",
+    startedAt: fields.startedAt || "",
+    endedAt: "",
+    durationMs: 0
+  };
+}
+
+function runOutcomeText(outcome) {
+  return {
+    fixed: "已自动修复",
+    analyzed: "已完成分析",
+    "needs-human": "需要人工处理",
+    "not-a-bug": "判定为非缺陷",
+    "cannot-reproduce": "无法复现",
+    blocked: "处理受阻"
+  }[outcome] || outcome || "—";
+}
+
+function buildAgentPrompt(policy, defect, detail, agentMode) {
+  const comments = (detail.comments || []).slice(-5)
+    .map((item) => `- ${item.userName || "用户"}：${cleanTextPreserve(item.content, 600).replace(/\s+/g, " ")}`)
+    .join("\n");
+  const attachmentNames = (detail.attachments || []).map((item) => item.fileName).filter(Boolean).join("、");
+  const lines = [
+    "你在处理云效缺陷。只允许改动与本缺陷直接相关的文件。",
+    "",
+    "## 缺陷",
+    `编号 ${defect.serialNumber || defect.id}｜优先级 ${defect.priority || "未设置"}｜状态 ${defect.statusName || "未知"}｜类型 ${defect.workitemType || "缺陷"}`,
+    `标题：${defect.subject || "（无标题）"}`,
+    `描述：`,
+    cleanTextPreserve(detail.description || "（无描述）", 20_000)
+  ];
+  if (comments) lines.push("", "## 最近评论", comments);
+  if (attachmentNames) lines.push("", `附件：${attachmentNames}`);
+  lines.push(
+    "",
+    `## 处理规则（来自编排规则「${policy.name}」，最高优先级遵守）`,
+    cleanTextPreserve(policy.instructions, 8000) || "（无附加规则）",
+    "",
+    "## 模式要求"
+  );
+  const submit = policy.submit || {};
+  if (agentMode === "analyze") {
+    lines.push(
+      "本次只读诊断：禁止修改任何文件、禁止执行写入类命令。",
+      "产出根因分析、修复方案（含涉及文件清单）与风险影响面。",
+      "完成后必须调用 yunxiao_report_result 汇报：outcome 取 analyzed；确认无需修复时取 not-a-bug 或 cannot-reproduce。"
+    );
+  } else {
+    lines.push(
+      `在仓库内新建分支实施修复：从 ${submit.baseBranch || "当前默认分支"} 切出，分支名遵循 ${submit.branchPattern || "fix/{serial}-{slug}"}。`,
+      "完成修改后逐条运行验证命令，把每条命令与执行结果如实写进 report.verify；任一验证失败都要如实标记。",
+      submit.push === false ? "验证通过后本地提交即可，不要推送。" : "验证通过后提交并推送分支。",
+      `改动文件数不得超过 ${submit.maxChangedFiles || 30}；超过视为超范围，停止实施并以 needs-human 汇报。`
+    );
+    if ((submit.forbiddenPaths || []).length) {
+      lines.push(`禁止改动这些路径：${submit.forbiddenPaths.join("、")}。`);
+    }
+    lines.push("无法完成或判断需要人工介入时，以 needs-human 汇报并说明原因，不要强行修复。");
+  }
+  lines.push(
+    "",
+    "## 收尾（必须）",
+    "最后必须调用 yunxiao_report_result 一次性汇报结果；结论只通过该工具的入参表达，不要用自然语言复述。"
+  );
+  return lines.join("\n");
+}
+
+function buildApprovalPrompt(run) {
+  const result = run.result || {};
+  return [
+    "用户已在云效工作台批准该缺陷的修复方案，请继续实施：",
+    result.plan ? `按既定方案执行：${result.plan}` : "按此前分析的方案执行。",
+    "实施完成、验证通过后提交并推送分支，然后再次调用 yunxiao_report_result 汇报（outcome 取 fixed 或 needs-human，branch / commits / changedFiles / verify 必须如实填写）。",
+    "若实施中发现方案不可行，停止实施并以 needs-human 汇报，不要强行修复。"
+  ].join("\n");
+}
+
+function buildWritebackComment(run, extra) {
+  const result = run.result || {};
+  const lines = [
+    `### 🤖 云效编排自动处理（规则「${run.policyName}」）`,
+    "",
+    `- **结果**：${runOutcomeText(result.outcome)}`
+  ];
+  if (result.summary) lines.push(`- **摘要**：${result.summary}`);
+  if (result.rootCause) lines.push(`- **根因**：${result.rootCause}`);
+  if (result.plan) lines.push(`- **修复方案**：${result.plan}`);
+  if (result.risk) lines.push(`- **风险**：${result.risk}`);
+  if (result.branch) lines.push(`- **分支**：\`${result.branch}\``);
+  if ((result.commits || []).length) lines.push(`- **提交**：${result.commits.map((item) => `\`${item}\``).join(" ")}`);
+  if ((result.changedFiles || []).length) {
+    lines.push(`- **改动文件**（${result.changedFiles.length}）：`);
+    for (const file of result.changedFiles.slice(0, 30)) lines.push(`  - \`${file}\``);
+  }
+  if (result.mrUrl) lines.push(`- **合并请求**：${result.mrUrl}`);
+  if ((result.verify || []).length) {
+    lines.push("- **验证**：");
+    for (const item of result.verify) lines.push(`  - ${item.ok ? "✅" : "❌"} \`${item.command}\``);
+  }
+  if (extra) lines.push(`- **备注**：${extra}`);
+  if (run.error) lines.push(`- **失败原因**：${run.error}`);
+  lines.push("", "> 由云效工作台规则引擎自动处理，步骤详情见工作台「编排 → 运行记录」。");
+  return lines.join("\n");
+}
+
+function createPolicyEngine({ store, api, notify, timeScale = 1 } = {}) {
+  if (!store || !api) throw new Error("createPolicyEngine 需要 store 与 api");
+  const scale = Number(timeScale) > 0 ? Number(timeScale) : 1;
+
+  let svc = null;
+  let started = false;
+  let timer = null;
+  let kickTimer = null;
+  let scanning = false;
+  let lastScanAt = "";
+  let lastScanError = "";
+  const queue = [];
+  const activeByDefect = new Map();
+  const live = new Map();
+  const statusCache = new Map();
+
+  function isAvailable() {
+    return Boolean(started && svc);
+  }
+
+  function start(injected) {
+    svc = injected || null;
+    started = true;
+    schedule();
+    // 启动后先扫一轮，不必等第一个周期。
+    if (kickTimer) clearTimeout(kickTimer);
+    kickTimer = setTimeout(() => {
+      kickTimer = null;
+      scanOnce().catch(() => {});
+    }, 3_000 * scale);
+    if (kickTimer.unref) kickTimer.unref();
+  }
+
+  function stop() {
+    started = false;
+    if (timer) { clearInterval(timer); timer = null; }
+    if (kickTimer) { clearTimeout(kickTimer); kickTimer = null; }
+    for (const [runId, ctx] of [...live]) {
+      try { ctx.handle?.agent?.cancel?.({ kind: "disposed" }); } catch {}
+      if (RUN_ACTIVE_STATUSES.has(ctx.run.status)) {
+        ctx.run.status = "interrupted";
+        ctx.run.error = "插件重载，运行中断";
+        ctx.run.endedAt = new Date().toISOString();
+        store.saveRun(ctx.run).catch(() => {});
+      }
+      live.delete(runId);
+      activeByDefect.delete(ctx.run.defectId);
+    }
+    queue.length = 0;
+  }
+
+  function reschedule() {
+    schedule();
+  }
+
+  async function schedule() {
+    if (timer) { clearInterval(timer); timer = null; }
+    if (!isAvailable()) return;
+    let minutes = 0;
+    try {
+      const policies = await store.listPolicies();
+      const enabled = policies.filter((item) => item.enabled);
+      if (enabled.length) {
+        minutes = Math.max(1, Math.min(...enabled.map((item) => clampInteger(item.trigger.pollMinutes, 5, 1, 1440))));
+      }
+    } catch {}
+    if (!minutes) return;
+    timer = setInterval(() => {
+      scanOnce().catch((error) => {
+        lastScanError = error instanceof Error ? error.message : String(error);
+      });
+    }, Math.max(1_000, minutes * 60_000 * scale));
+    if (timer.unref) timer.unref();
+  }
+
+  async function projectStatuses(account, projectId) {
+    const key = `${account.id}:${projectId}`;
+    const cached = statusCache.get(key);
+    if (cached && Date.now() - cached.at < 10 * 60_000) return cached.statuses;
+    const resolved = await api.resolveNotificationStatuses(account, projectId);
+    const statuses = resolved
+      .map((status) => ({ id: status.id, name: status.name, kind: notificationStatusKind(status.name) }))
+      .filter((status) => status.kind);
+    statusCache.set(key, { at: Date.now(), statuses });
+    return statuses;
+  }
+
+  async function scanOnce() {
+    if (!isAvailable()) return { ok: false, reason: "引擎不可用" };
+    if (scanning) return { ok: false, reason: "上一轮扫描尚未结束" };
+    scanning = true;
+    try {
+      const policies = await store.listPolicies();
+      const results = [];
+      for (const policy of policies) {
+        if (!policy.enabled) continue;
+        const intervalMs = clampInteger(policy.trigger.pollMinutes, 5, 1, 1440) * 60_000;
+        const lastMs = policy.lastScanAt ? Date.parse(policy.lastScanAt) : NaN;
+        if (Number.isFinite(lastMs) && Date.now() - lastMs < intervalMs * 0.98) continue;
+        try {
+          results.push({ policyId: policy.id, name: policy.name, ...(await scanPolicy(policy)) });
+        } catch (error) {
+          results.push({ policyId: policy.id, name: policy.name, error: error instanceof Error ? error.message : String(error) });
+        }
+      }
+      lastScanAt = new Date().toISOString();
+      lastScanError = results.find((item) => item.error)?.error || "";
+      drain();
+      return { ok: true, at: lastScanAt, results };
+    } finally {
+      scanning = false;
+    }
+  }
+
+  async function scanPolicy(policy) {
+    const scope = await store.resolvePolicyScope(policy);
+    const kinds = new Set(policy.trigger.statusKinds?.length ? policy.trigger.statusKinds : ["pending", "reopened"]);
+    const statuses = (await projectStatuses(scope.account, scope.projectId)).filter((status) => kinds.has(status.kind));
+    if (!statuses.length) throw new YunxiaoError("未能识别「待确认 / 再次打开」状态 ID，请先在缺陷通知配置里启用一次", 422);
+    const results = await Promise.all(statuses.map((status) => api.listDefects(scope.account, scope.projectId, {
+      page: 1,
+      pageSize: ENGINE_SCAN_PAGE_SIZE,
+      assignedToId: policy.trigger.assigneeId,
+      statusIds: [status.id],
+      orderBy: "gmtModified"
+    })));
+    const items = [...new Map(results.flatMap((result) => result.items || [])
+      .filter((item) => item.id)
+      .map((item) => [item.id, item])).values()];
+    const state = await store.load();
+    const seen = state.runsSeen || {};
+    const firstScan = !policy.lastScanAt;
+    const snapshot = [];
+    let matched = 0;
+    for (const item of items) {
+      const fingerprint = `${item.statusId || ""}:${item.gmtModified || ""}`;
+      // 首轮只做快照（backfill 关闭时），避免把启用规则前的存量缺陷当成新增。
+      if (firstScan && !policy.trigger.backfill) {
+        snapshot.push({ defectId: item.id, policyId: policy.id, fingerprint });
+        continue;
+      }
+      if (activeByDefect.has(item.id) || queue.some((job) => job.defectId === item.id)) continue;
+      const known = seen[item.id];
+      if (known && known.fingerprint === fingerprint) continue;
+      const lastMs = known?.runId ? Date.parse(known.at) : NaN;
+      if (Number.isFinite(lastMs) && Date.now() - lastMs < ENGINE_COOLDOWN_MS && ENGINE_SEEN_TERMINAL.has(known.outcome)) continue;
+      if (!policyMatches(policy, item).matched) continue;
+      matched += 1;
+      queue.push({
+        policyId: policy.id,
+        defectId: item.id,
+        fingerprint,
+        serial: item.serialNumber || "",
+        subject: item.subject || "",
+        mode: policy.mode
+      });
+      await store.markSeen(item.id, { policyId: policy.id, fingerprint, outcome: "queued" });
+    }
+    if (snapshot.length) await store.markSeenBatch(snapshot);
+    await store.markPolicyScanned(policy.id, new Date().toISOString());
+    return { scanned: items.length, matched, snapshotted: snapshot.length };
+  }
+
+  function drain() {
+    if (!isAvailable()) return;
+    while (activeByDefect.size < ENGINE_MAX_CONCURRENCY && queue.length) {
+      const job = queue.shift();
+      if (activeByDefect.has(job.defectId)) continue;
+      runJob(job).catch(() => {});
+    }
+  }
+
+  async function runJob(job) {
+    const policies = await store.listPolicies();
+    const policy = policies.find((item) => item.id === job.policyId);
+    const startedAt = new Date().toISOString();
+    if (!policy || !policy.enabled) {
+      await store.markSeen(job.defectId, { policyId: job.policyId, fingerprint: job.fingerprint, at: startedAt, outcome: "skipped" }).catch(() => {});
+      return;
+    }
+    const run = blankRun({
+      policyId: policy.id,
+      policyName: policy.name,
+      defectId: job.defectId,
+      serial: job.serial,
+      subject: job.subject,
+      mode: policy.mode,
+      fingerprint: job.fingerprint,
+      startedAt
+    });
+    const ctx = {
+      run,
+      policy,
+      handle: null,
+      abort: new AbortController(),
+      detail: null,
+      defect: null,
+      account: null,
+      projectId: "",
+      workspace: null,
+      imageRefs: [],
+      report: null,
+      holdsLive: false
+    };
+    activeByDefect.set(job.defectId, run.id);
+    live.set(run.id, ctx);
+    try {
+      await persistRun(ctx, { status: "fetching" }, "拉取缺陷详情");
+      const scope = await store.resolvePolicyScope(policy);
+      ctx.account = scope.account;
+      ctx.projectId = scope.projectId;
+      ctx.workspace = scope.workspace;
+      run.accountId = scope.account.id;
+      run.projectId = scope.projectId;
+      run.workspaceId = scope.workspace?.id || "";
+      if (policy.mode !== "notify" && !scope.workspace?.path) {
+        throw new YunxiaoError("项目未绑定 DSH 工作区，无法自动处理", 422);
+      }
+      const detail = await api.getDefect(scope.account, scope.projectId, job.defectId);
+      ctx.detail = detail;
+      ctx.defect = detail.defect;
+      run.serial = detail.defect.serialNumber || run.serial;
+      run.subject = detail.defect.subject || run.subject;
+      await persistRun(ctx, { status: "classifying" }, "按规则匹配");
+      const verdict = policyMatches(policy, { ...detail.defect, description: detail.description });
+      if (!verdict.matched) {
+        await finishRun(ctx, { status: "skipped" }, `未命中匹配条件：${verdict.reason}`);
+        return;
+      }
+      if (policy.mode === "notify") {
+        await persistRun(ctx, { status: "writeback" }, "发送通知");
+        await writebackNotify(ctx);
+        await finishRun(ctx, { status: "succeeded" }, "已发送处理提醒");
+        return;
+      }
+      ctx.imageRefs = await loadImageRefs(ctx);
+      await persistRun(ctx, { status: "agent-running" }, policy.mode === "analyze-confirm" ? "智能体只读诊断" : "智能体实施修复");
+      await runAgentStage(ctx, policy.mode === "analyze-confirm" ? "analyze" : "implement");
+      if (policy.mode === "analyze-confirm") {
+        await writebackAnalysis(ctx);
+        ctx.holdsLive = true;
+        await persistRun(ctx, { status: "awaiting-confirm" }, "分析完成，等待人工确认");
+        notifyUser(`云效缺陷 ${run.serial} 待确认`, `「${run.subject}」分析完成，请到工作台「编排 → 待确认」裁决`);
+        return;
+      }
+      await implementAndSubmit(ctx);
+    } catch (error) {
+      await handleRunError(ctx, error);
+    } finally {
+      if (!ctx.holdsLive) {
+        live.delete(run.id);
+        activeByDefect.delete(job.defectId);
+        drain();
+      }
+    }
+  }
+
+  async function handleRunError(ctx, error) {
+    if (ctx.abort.signal.aborted || error instanceof EngineCancel) {
+      await finishRun(ctx, { status: "canceled" }, "已取消");
+      return;
+    }
+    const message = error instanceof Error ? error.message : String(error);
+    const status = error?.runStatus === "needs-human" ? "needs-human" : "failed";
+    ctx.run.error = cleanTextPreserve(message, 2000).trim();
+    const extra = status === "needs-human" ? "" : "该缺陷未被修改；如已产生分支会在下方说明。";
+    // 回写失败信息：尽力而为，单步失败不阻塞收尾。
+    if (ctx.policy.writeback.comment && ctx.defect) {
+      try {
+        await api.createDefectComment(ctx.account, ctx.projectId, ctx.defect.id, buildWritebackComment(ctx.run, extra));
+      } catch {}
+    }
+    try {
+      if (ctx.policy.writeback.statusOnFailure) await applyStatusByName(ctx, ctx.policy.writeback.statusOnFailure);
+    } catch {}
+    try {
+      if (ctx.policy.writeback.assigneeOnFailure) {
+        await api.updateDefectAssignee(ctx.account, ctx.projectId, ctx.defect.id, ctx.policy.writeback.assigneeOnFailure);
+      }
+    } catch {}
+    notifyUser(`云效缺陷 ${ctx.run.serial} 处理${status === "needs-human" ? "需人工" : "失败"}`, `${ctx.run.subject}：${message.slice(0, 200)}`);
+    await finishRun(ctx, { status }, cleanTextPreserve(message, 200));
+  }
+
+  // auto-submit 与「分析后批准」共用的实施 + 提交 + 回写。
+  async function implementAndSubmit(ctx) {
+    const report = normalizeRunResult(ctx.report);
+    if (!report.outcome) report.outcome = "needs-human";
+    ctx.run.result = report;
+    if (report.outcome !== "fixed") {
+      await persistRun(ctx, { status: "writeback" }, `智能体结论：${runOutcomeText(report.outcome)}`);
+      await writebackResult(ctx, report, "");
+      const status = ["needs-human", "blocked"].includes(report.outcome) ? "needs-human" : "succeeded";
+      await finishRun(ctx, { status }, `智能体结论：${runOutcomeText(report.outcome)}`);
+      return;
+    }
+    const guard = checkSubmitGuardrails(ctx.policy, report);
+    if (!guard.ok) {
+      report.outcome = "needs-human";
+      report.risk = cleanTextPreserve([report.risk, guard.reason].filter(Boolean).join("；"), 2000);
+      ctx.run.error = cleanTextPreserve(guard.reason, 2000).trim();
+      await persistRun(ctx, { status: "writeback" }, `提交护栏拦截：${guard.reason}`);
+      await writebackResult(ctx, report, guard.reason);
+      notifyUser(`云效缺陷 ${ctx.run.serial} 需人工确认`, `${ctx.run.subject}：${guard.reason}`);
+      await finishRun(ctx, { status: "needs-human" }, guard.reason);
+      return;
+    }
+    await persistRun(ctx, { status: "submitting" }, "创建合并请求");
+    let mrNote = "";
+    if (ctx.policy.submit.createMr) {
+      const mr = await api.createChangeRequest(ctx.account, ctx.policy.submit.repoId, {
+        sourceBranch: report.branch,
+        targetBranch: ctx.policy.submit.mrTarget || "",
+        title: renderPolicyTemplate(ctx.policy.submit.mrTitle || "fix({serial}): {subject}", {
+          serial: ctx.run.serial,
+          subject: ctx.run.subject,
+          slug: policySlug(ctx.run.subject)
+        }),
+        description: buildWritebackComment(ctx.run, "该合并请求由规则引擎创建，请人工评审后合入。"),
+        workItemIds: [ctx.defect.id]
+      });
+      report.mrId = mr.localId || "";
+      report.mrUrl = mr.url || "";
+      mrNote = mr.url ? `合并请求：${mr.url}` : "合并请求已创建";
+    } else {
+      mrNote = "按规则配置未创建合并请求";
+    }
+    if (ctx.policy.submit.pipelineId) {
+      await persistRun(ctx, { status: "submitting" }, "触发流水线并等待结果");
+      const pipeline = await runPipelineAndWait(ctx, ctx.policy.submit.pipelineId);
+      report.pipelineRunId = pipeline.runId;
+      report.verify.push({ command: `pipeline:${ctx.policy.submit.pipelineId}`, ok: pipeline.ok, output: pipeline.detail });
+      if (!pipeline.ok) {
+        throw Object.assign(new YunxiaoError(`流水线未通过：${pipeline.detail}`, 502), {
+          runStatus: "failed",
+          branchKept: report.branch
+        });
+      }
+    }
+    await persistRun(ctx, { status: "writeback" }, "回写缺陷");
+    await writebackResult(ctx, report, mrNote);
+    notifyUser(`云效缺陷 ${ctx.run.serial} 已自动修复`, `${ctx.run.subject}${report.mrUrl ? `，${report.mrUrl}` : ""}`);
+    await finishRun(ctx, { status: "succeeded" }, "修复完成并通过验证");
+  }
+
+  function checkSubmitGuardrails(policy, report) {
+    if (!report.branch) return { ok: false, reason: "智能体未报告分支名" };
+    if (!(report.commits || []).length) return { ok: false, reason: "智能体未报告任何提交" };
+    if (!(report.changedFiles || []).length) return { ok: false, reason: "智能体未报告改动文件" };
+    if (report.changedFiles.length > policy.submit.maxChangedFiles) {
+      return { ok: false, reason: `改动文件 ${report.changedFiles.length} 个，超过上限 ${policy.submit.maxChangedFiles}` };
+    }
+    for (const pattern of policy.submit.forbiddenPaths || []) {
+      const regexp = globToRegExp(pattern);
+      const hit = report.changedFiles.find((file) => regexp.test(file));
+      if (hit) return { ok: false, reason: `改动命中禁改路径 ${pattern}（${hit}）` };
+    }
+    for (const item of report.verify || []) {
+      if (!item.ok) return { ok: false, reason: `验证命令未通过：${item.command}` };
+    }
+    return { ok: true, reason: "" };
+  }
+
+  async function runPipelineAndWait(ctx, pipelineId) {
+    const created = await api.createPipelineRun(ctx.account, pipelineId, {
+      branchModeBranches: [ctx.run.result.branch],
+      comment: `云效编排自动触发（缺陷 ${ctx.run.serial}）`
+    });
+    const deadline = Date.now() + ENGINE_PIPELINE_MAX_MS * scale;
+    let latest = null;
+    while (Date.now() < deadline) {
+      await new Promise((resolve) => {
+        const timer = setTimeout(resolve, ENGINE_PIPELINE_POLL_MS * scale);
+        if (timer.unref) timer.unref();
+      });
+      if (ctx.abort.signal.aborted) throw new EngineCancel();
+      try {
+        latest = await api.getPipelineRun(ctx.account, pipelineId, created.pipelineRunId);
+      } catch {}
+      const status = String(latest?.status || "").toUpperCase();
+      if (["FINISHED", "SUCCESS", "SUCCEEDED", "CANCELED", "FAILED", "ERROR", "TIMEOUT"].includes(status)) {
+        const ok = ["FINISHED", "SUCCESS", "SUCCEEDED"].includes(status);
+        return { runId: created.pipelineRunId, ok, detail: `流水线状态 ${status}` };
+      }
+    }
+    return { runId: created.pipelineRunId, ok: false, detail: "流水线等待超时" };
+  }
+
+  async function runAgentStage(ctx, agentMode) {
+    const preset = await svc.agentPresets.resolve(cleanText(ctx.policy.agent.preset, 100) || undefined);
+    const workspace = await svc.workspaceRegistry.create(ctx.workspace.path);
+    const sessionId = `yunxiao-${ctx.run.id}`;
+    const handle = await svc.agents.create({
+      sessionId,
+      signal: ctx.abort.signal,
+      meta: { cwd: workspace.path, agentPreset: preset.id },
+      agentOptions: parseAgentOptions(ctx.policy.agent.model),
+      setup: async (agentCtx) => {
+        await svc.agentPresets.mount(agentCtx, preset.id);
+        registerEngineTools(agentCtx, ctx);
+      }
+    });
+    ctx.handle = handle;
+    ctx.run.sessionId = sessionId;
+    try {
+      await workspace.attachSession(sessionId);
+    } catch (error) {
+      await disposeQuietly(handle);
+      throw error;
+    }
+    const permissionName = resolvePermissionName(ctx.policy, agentMode);
+    if (permissionName) {
+      try { svc.permissionPresets.set(handle.agent.session, permissionName); } catch {}
+    } else if (agentMode === "implement") {
+      pushLog(ctx, "未找到可用的无审批写入权限预设，无人值守可能在审批处停滞（超时转人工）");
+    }
+    try {
+      svc.sessionTitle.rename(handle.agent.session, `[云效] ${ctx.run.serial} ${ctx.run.subject}`.slice(0, 120));
+    } catch {}
+    handle.agent.followup({
+      id: randomUUID(),
+      role: "user",
+      content: [
+        ...ctx.imageRefs.map((ref) => ({ type: "image", attachment: ref })),
+        { type: "text", text: buildAgentPrompt(ctx.policy, ctx.defect, ctx.detail, agentMode) }
+      ],
+      source: {
+        kind: "plugin",
+        plugin: name,
+        form: "notice",
+        summary: `云效缺陷 ${ctx.run.serial} 自动处理（${agentMode === "analyze" ? "只读诊断" : "实施修复"}）`
+      }
+    });
+    await waitAgentIdle(ctx, clampInteger(ctx.policy.agent.maxMinutes, 30, 1, 720) * 60_000 * scale);
+  }
+
+  function resolvePermissionName(policy, agentMode) {
+    if (!svc?.permissionPresets) return "";
+    const names = svc.permissionPresets.names || [];
+    const specOf = (presetName) => {
+      try { return svc.permissionPresets.resolve(presetName); } catch { return null; }
+    };
+    if (agentMode === "analyze") {
+      if (names.includes("read-only")) return "read-only";
+      for (const presetName of names) {
+        if (specOf(presetName)?.sandbox === "read-only") return presetName;
+      }
+      return "";
+    }
+    const wanted = cleanText(policy.agent.permissionPreset, 100);
+    if (wanted && names.includes(wanted)) return wanted;
+    for (const presetName of names) {
+      const spec = specOf(presetName);
+      if (spec?.sandbox === "workspace-write" && spec?.approval === "never") return presetName;
+    }
+    return "";
+  }
+
+  function waitAgentIdle(ctx, timeoutMs) {
+    return new Promise((resolve, reject) => {
+      let timer = null;
+      const onAbort = () => {
+        if (timer) clearTimeout(timer);
+        reject(new EngineCancel());
+      };
+      if (ctx.abort.signal.aborted) {
+        reject(new EngineCancel());
+        return;
+      }
+      ctx.abort.signal.addEventListener("abort", onAbort, { once: true });
+      const idle = ctx.handle.agent.whenIdle();
+      timer = setTimeout(() => {
+        ctx.abort.signal.removeEventListener("abort", onAbort);
+        try { ctx.handle?.agent?.cancel({ kind: "user" }); } catch {}
+        idle.catch(() => {});
+        reject(Object.assign(new YunxiaoError(`智能体处理超过 ${Math.round(timeoutMs / 60_000 / scale)} 分钟，已中止`, 504), { runStatus: "needs-human" }));
+      }, Math.max(1_000, timeoutMs));
+      if (timer.unref) timer.unref();
+      idle.then(() => {
+        if (timer) clearTimeout(timer);
+        ctx.abort.signal.removeEventListener("abort", onAbort);
+        resolve();
+      }, (error) => {
+        if (timer) clearTimeout(timer);
+        ctx.abort.signal.removeEventListener("abort", onAbort);
+        reject(error instanceof Error ? error : new Error(String(error)));
+      });
+    });
+  }
+
+  function registerEngineTools(agentCtx, ctx) {
+    agentCtx.tools.register({
+      name: "yunxiao_defect_context",
+      description: "读取当前正在处理的云效缺陷的结构化上下文（标题、状态、负责人、描述、最近评论、附件清单）。",
+      parameters: { type: "object", additionalProperties: false, properties: {} },
+      isConcurrencySafe: () => true,
+      output: {
+        schema: { type: "object", additionalProperties: true },
+        render: (_args, value) => [{ type: "text", text: JSON.stringify(value, null, 2) }]
+      },
+      execute: async () => ({
+        defect: ctx.defect,
+        description: ctx.detail?.description || "",
+        comments: (ctx.detail?.comments || []).slice(-10),
+        attachments: (ctx.detail?.attachments || []).map((item) => ({ fileName: item.fileName, suffix: item.suffix }))
+      })
+    });
+    agentCtx.tools.register({
+      name: "yunxiao_progress",
+      description: "汇报处理进度（会记录到运行时间线，模型可见的返回值恒为 ok）。",
+      parameters: {
+        type: "object",
+        additionalProperties: false,
+        properties: { message: { type: "string", description: "一句话进度说明" } },
+        required: ["message"]
+      },
+      isConcurrencySafe: () => true,
+      output: {
+        schema: { type: "object", additionalProperties: true },
+        render: (_args, value) => [{ type: "text", text: JSON.stringify(value) }]
+      },
+      execute: async (args) => {
+        const message = cleanTextPreserve(args?.message, 500).trim();
+        if (message) {
+          pushLog(ctx, message);
+          store.saveRun(ctx.run).catch(() => {});
+        }
+        return { ok: true };
+      }
+    });
+    agentCtx.tools.register({
+      name: "yunxiao_report_result",
+      description: "汇报缺陷处理结果并结束本轮：处理完成后必须调用一次，结论以入参为准。",
+      parameters: {
+        type: "object",
+        additionalProperties: false,
+        properties: {
+          outcome: { type: "string", enum: [...REPORT_OUTCOMES], description: "处理结论" },
+          summary: { type: "string", description: "结果摘要（面向缺陷评论）" },
+          rootCause: { type: "string", description: "根因分析" },
+          plan: { type: "string", description: "修复方案（分析模式必填）" },
+          risk: { type: "string", description: "风险与影响面" },
+          branch: { type: "string", description: "修复分支名" },
+          commits: { type: "array", items: { type: "string" }, description: "提交哈希列表" },
+          changedFiles: { type: "array", items: { type: "string" }, description: "改动文件路径列表" },
+          verify: {
+            type: "array",
+            items: {
+              type: "object",
+              additionalProperties: false,
+              properties: {
+                command: { type: "string" },
+                ok: { type: "boolean" },
+                output: { type: "string" }
+              },
+              required: ["command", "ok"]
+            },
+            description: "验证命令与结果"
+          }
+        },
+        required: ["outcome", "summary"]
+      },
+      output: {
+        schema: { type: "object", additionalProperties: true },
+        render: (_args, value) => [{ type: "text", text: JSON.stringify(value) }]
+      },
+      execute: async (args, exec) => {
+        ctx.report = args && typeof args === "object" ? args : {};
+        exec.concludeTurn();
+        return { ok: true };
+      }
+    });
+  }
+
+  async function disposeQuietly(handle) {
+    try { await handle?.dispose?.(); } catch {}
+  }
+
+  async function loadImageRefs(ctx) {
+    if (!svc?.attachments) return [];
+    const images = (ctx.detail.attachments || [])
+      .filter((item) => mediaTypeFromSuffix(item.suffix || item.fileName))
+      .slice(0, ENGINE_IMAGE_LIMIT);
+    const refs = [];
+    for (const image of images) {
+      try {
+        const data = await api.getAttachmentData(ctx.account, ctx.projectId, ctx.defect.id, image.fileId, { maxBytes: 10_000_000 });
+        if (!IMAGE_MEDIA_TYPES.has(data.mediaType)) continue;
+        const saved = await svc.attachments.saveImages([{
+          data: Buffer.from(data.data, "base64"),
+          mediaType: data.mediaType,
+          name: image.fileName || image.fileId
+        }]);
+        refs.push(...saved);
+      } catch {
+        pushLog(ctx, `附件「${image.fileName || image.fileId}」读取失败，已跳过`);
+      }
+    }
+    return refs;
+  }
+
+  async function applyStatusByName(ctx, statusName) {
+    const wanted = cleanText(statusName, 100);
+    if (!wanted || !ctx.defect) return false;
+    const options = await api.listDefectStatusOptions(ctx.account, ctx.projectId);
+    const target = options.find((option) => option.name === wanted);
+    if (!target) throw new YunxiaoError(`项目工作流中不存在状态「${wanted}」`, 422);
+    await api.updateDefectStatus(ctx.account, ctx.projectId, ctx.defect.id, target.id);
+    return true;
+  }
+
+  async function writebackNotify(ctx) {
+    if (ctx.policy.writeback.comment && ctx.defect) {
+      try {
+        await api.createDefectComment(ctx.account, ctx.projectId, ctx.defect.id,
+          buildWritebackComment(ctx.run, "该缺陷命中了仅通知规则，请负责人跟进。"));
+      } catch {}
+    }
+    notifyUser(`云效缺陷 ${ctx.run.serial} 待处理`, `${ctx.run.subject}（规则「${ctx.policy.name}」）`);
+  }
+
+  async function writebackAnalysis(ctx) {
+    const report = normalizeRunResult(ctx.report);
+    if (!report.outcome) report.outcome = "analyzed";
+    ctx.run.result = report;
+    if (ctx.policy.writeback.comment && ctx.defect) {
+      try {
+        await api.createDefectComment(ctx.account, ctx.projectId, ctx.defect.id,
+          buildWritebackComment(ctx.run, "以下结论待确认后才会实施修复。"));
+      } catch {}
+    }
+    try {
+      if (ctx.policy.writeback.statusOnConfirm) await applyStatusByName(ctx, ctx.policy.writeback.statusOnConfirm);
+    } catch (error) {
+      pushLog(ctx, `状态流转失败：${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+
+  async function writebackResult(ctx, report, extra) {
+    if (ctx.policy.writeback.comment && ctx.defect) {
+      try {
+        await api.createDefectComment(ctx.account, ctx.projectId, ctx.defect.id, buildWritebackComment(ctx.run, extra));
+      } catch {}
+    }
+    const success = report.outcome === "fixed";
+    const statusName = success ? ctx.policy.writeback.statusOnSuccess : ctx.policy.writeback.statusOnFailure;
+    try {
+      if (statusName) await applyStatusByName(ctx, statusName);
+    } catch (error) {
+      pushLog(ctx, `状态流转失败：${error instanceof Error ? error.message : String(error)}`);
+    }
+    if (!success && ctx.policy.writeback.assigneeOnFailure) {
+      try {
+        await api.updateDefectAssignee(ctx.account, ctx.projectId, ctx.defect.id, ctx.policy.writeback.assigneeOnFailure);
+      } catch {}
+    }
+  }
+
+  function pushStep(ctx, status, detail) {
+    ctx.run.steps.push({ name: status, status: "ok", at: new Date().toISOString(), detail: cleanTextPreserve(detail, 2000).trim() });
+  }
+
+  function pushLog(ctx, message) {
+    ctx.run.log.push({ t: new Date().toISOString(), m: cleanTextPreserve(message, 2000).trim(), c: "" });
+  }
+
+  async function persistRun(ctx, patch, stepDetail) {
+    Object.assign(ctx.run, patch);
+    if (stepDetail) pushStep(ctx, patch.status || ctx.run.status, stepDetail);
+    await store.saveRun({ ...ctx.run }).catch(() => {});
+  }
+
+  async function finishRun(ctx, patch, detail) {
+    Object.assign(ctx.run, patch);
+    if (detail) pushStep(ctx, patch.status, detail);
+    ctx.run.endedAt = new Date().toISOString();
+    const startMs = Date.parse(ctx.run.startedAt || ctx.run.endedAt);
+    ctx.run.durationMs = Number.isFinite(startMs) ? Math.max(0, Date.parse(ctx.run.endedAt) - startMs) : 0;
+    await store.saveRun({ ...ctx.run }).catch(() => {});
+    if (ctx.run.defectId) {
+      const outcome = ctx.run.result?.outcome || ctx.run.status;
+      await store.markSeen(ctx.run.defectId, {
+        runId: ctx.run.id,
+        policyId: ctx.run.policyId,
+        fingerprint: ctx.run.fingerprint,
+        outcome: ["succeeded", "needs-human", "failed", "skipped", "canceled", "interrupted"].includes(ctx.run.status)
+          ? (ctx.run.status === "succeeded" ? outcome : ctx.run.status)
+          : outcome
+      }).catch(() => {});
+    }
+  }
+
+  function notifyUser(title, body) {
+    if (!notify) return;
+    notify(title, body, { tag: `dyx-run-${Date.now()}` }).catch(() => {});
+  }
+
+  // —— 待确认裁决 / 取消 / 重试 ————————————————————————————————————————————
+  async function confirmRun(runId, decision) {
+    const run = await store.getRun(runId);
+    if (!run) throw new YunxiaoError("运行记录不存在", 404);
+    if (run.status !== "awaiting-confirm") {
+      throw new YunxiaoError(`运行当前状态为「${run.status}」，无法裁决`, 409);
+    }
+    const ctx = live.get(runId);
+    if (!ctx || !ctx.handle) {
+      throw new YunxiaoError("该运行已随宿主重启中断，无法在同会话继续；请对缺陷重试", 410);
+    }
+    if (decision === "approve") {
+      const permissionName = resolvePermissionName(ctx.policy, "implement");
+      if (permissionName) {
+        try { svc.permissionPresets.set(ctx.handle.agent.session, permissionName); } catch {}
+      }
+      await persistRun(ctx, { status: "agent-running" }, "已批准，继续实施修复");
+      ctx.handle.agent.followup({
+        id: randomUUID(),
+        role: "user",
+        content: [{ type: "text", text: buildApprovalPrompt(ctx.run) }],
+        source: {
+          kind: "plugin",
+          plugin: name,
+          form: "notice",
+          summary: `云效缺陷 ${ctx.run.serial} 修复方案已批准`
+        }
+      });
+      // 异步续跑：RPC 立即返回，实施进度经 runs.list 轮询展示。
+      continueApproved(ctx).catch(() => {});
+      return { ok: true, status: "agent-running" };
+    }
+    if (decision === "handoff") {
+      try {
+        if (ctx.policy.writeback.assigneeOnFailure && ctx.defect) {
+          await api.updateDefectAssignee(ctx.account, ctx.projectId, ctx.defect.id, ctx.policy.writeback.assigneeOnFailure);
+        }
+      } catch {}
+      run.result = normalizeRunResult({ ...run.result, outcome: "needs-human" });
+      ctx.run.result = run.result;
+      notifyUser(`云效缺陷 ${run.serial} 已转人工`, run.subject);
+      await finishRun(ctx, { status: "needs-human" }, "人工裁决：转人工处理");
+      releaseLive(ctx);
+      return { ok: true, status: "needs-human" };
+    }
+    if (decision === "reject") {
+      await finishRun(ctx, { status: "canceled" }, "人工裁决：忽略");
+      releaseLive(ctx);
+      return { ok: true, status: "canceled" };
+    }
+    throw new YunxiaoError(`未知裁决：${cleanText(decision, 30)}`, 422);
+  }
+
+  async function continueApproved(ctx) {
+    try {
+      await waitAgentIdle(ctx, clampInteger(ctx.policy.agent.maxMinutes, 30, 1, 720) * 60_000 * scale);
+      await implementAndSubmit(ctx);
+    } catch (error) {
+      await handleRunError(ctx, error);
+    } finally {
+      releaseLive(ctx);
+      drain();
+    }
+  }
+
+  function releaseLive(ctx) {
+    ctx.holdsLive = false;
+    live.delete(ctx.run.id);
+    activeByDefect.delete(ctx.run.defectId);
+  }
+
+  async function cancelRun(runId) {
+    const ctx = live.get(runId);
+    if (!ctx) {
+      const run = await store.getRun(runId);
+      if (run && RUN_ACTIVE_STATUSES.has(run.status)) {
+        run.status = "canceled";
+        run.endedAt = run.endedAt || new Date().toISOString();
+        await store.saveRun(run);
+        return { ok: true, marked: true };
+      }
+      throw new YunxiaoError("运行未在进行中，无法取消", 409);
+    }
+    ctx.abort.abort();
+    try { ctx.handle?.agent?.cancel({ kind: "user" }); } catch {}
+    return { ok: true };
+  }
+
+  async function retryRun(run) {
+    if (!run?.defectId) throw new YunxiaoError("运行记录缺少缺陷 ID", 422);
+    if (activeByDefect.has(run.defectId)) throw new YunxiaoError("该缺陷已有进行中的运行", 409);
+    const fingerprint = run.fingerprint || `retry:${run.id}`;
+    queue.push({
+      policyId: run.policyId,
+      defectId: run.defectId,
+      fingerprint,
+      serial: run.serial || "",
+      subject: run.subject || "",
+      mode: run.mode || "analyze-confirm",
+      trigger: "retry"
+    });
+    await store.markSeen(run.defectId, { runId: "", policyId: run.policyId, fingerprint, outcome: "queued" });
+    drain();
+    return { ok: true, queued: true };
+  }
+
+  function status() {
+    return {
+      available: isAvailable(),
+      scanning,
+      queued: queue.length,
+      lastScanAt,
+      lastScanError,
+      active: [...activeByDefect].map(([defectId, runId]) => {
+        const ctx = live.get(runId);
+        return {
+          runId,
+          defectId,
+          serial: ctx?.run?.serial || "",
+          subject: ctx?.run?.subject || "",
+          policyName: ctx?.run?.policyName || "",
+          status: ctx?.run?.status || ""
+        };
+      })
+    };
+  }
+
+  return {
+    start,
+    stop,
+    reschedule,
+    scanOnce,
+    isAvailable,
+    confirmRun,
+    cancelRun,
+    retryRun,
+    status
   };
 }
 
@@ -2072,12 +3145,83 @@ async function clipboardStatus() {
   };
 }
 
-function createRpc(store, api, systemNotifier = showSystemNotification, listWorkspaces = () => []) {
+function createRpc(store, api, systemNotifier = showSystemNotification, listWorkspaces = () => [], engine = null) {
   async function accountAndProject(args) {
     const account = await store.getAccount(args.accountId);
     const projectId = cleanText(args.projectId || account.selectedProject?.id, 128);
     if (!projectId) throw new YunxiaoError("请先选择项目", 422);
     return { account, projectId };
+  }
+
+  // 保存规则时的静态校验：MR 创建必须有数字仓库 ID；配置了回写状态名时校验工作流里存在同名状态。
+  // 状态列表读取失败（离线/权限）不阻塞保存，由引擎运行时降级处理。
+  async function validatePolicy(policy) {
+    if (policy.mode === "auto-submit" && policy.submit.createMr && !/^\d+$/.test(policy.submit.repoId)) {
+      throw new YunxiaoError("「自动提交」并创建合并请求需要在提交设置里填写 Codeup 仓库的数字 ID", 422);
+    }
+    const statusNames = [
+      policy.writeback.statusOnSuccess,
+      policy.writeback.statusOnConfirm,
+      policy.writeback.statusOnFailure
+    ].filter(Boolean);
+    if (!statusNames.length) return policy;
+    let options = [];
+    try {
+      const scope = await store.resolvePolicyScope(policy);
+      options = await api.listDefectStatusOptions(scope.account, scope.projectId);
+    } catch {
+      return policy;
+    }
+    if (!options.length) return policy;
+    const known = new Set(options.map((option) => option.name));
+    for (const statusName of statusNames) {
+      if (!known.has(statusName)) {
+        throw new YunxiaoError(`项目工作流中不存在状态「${statusName}」，可选：${options.map((option) => option.name).join("、")}`, 422);
+      }
+    }
+    return policy;
+  }
+
+  // 试运行匹配：对触发状态下的最近缺陷跑一次规则匹配，返回命中明细（不创建运行）。
+  async function testPolicy(input) {
+    const draft = normalizePolicy({
+      ...(input && typeof input === "object" ? input : {}),
+      id: "draft",
+      name: cleanText(input?.name, 200) || "试运行规则"
+    });
+    if (!draft) throw new YunxiaoError("规则内容不完整", 422);
+    const scope = await store.resolvePolicyScope(draft);
+    const kinds = new Set(draft.trigger.statusKinds?.length ? draft.trigger.statusKinds : ["pending", "reopened"]);
+    const statuses = (await api.resolveNotificationStatuses(scope.account, scope.projectId))
+      .map((status) => ({ ...status, kind: notificationStatusKind(status.name) }))
+      .filter((status) => status.kind && kinds.has(status.kind));
+    const results = await Promise.all((statuses.length ? statuses : [{ id: "" }]).map((status) => api.listDefects(
+      scope.account,
+      scope.projectId,
+      { page: 1, pageSize: 50, assignedToId: draft.trigger.assigneeId, statusIds: status.id ? [status.id] : [], orderBy: "gmtModified" }
+    )));
+    const items = [...new Map(results.flatMap((result) => result.items || [])
+      .map((item) => [item.id, item])).values()]
+      .slice(0, 100)
+      .map((item) => {
+        const verdict = policyMatches(draft, item);
+        return {
+          id: item.id,
+          serialNumber: item.serialNumber,
+          subject: item.subject,
+          statusName: item.statusName,
+          priority: item.priority,
+          assignedToName: item.assignedToName,
+          matched: verdict.matched,
+          reason: verdict.reason,
+          mode: draft.mode
+        };
+      });
+    return {
+      items,
+      matched: items.filter((item) => item.matched).length,
+      total: items.length
+    };
   }
 
   async function cached(accountId, key, loader) {
@@ -2326,6 +3470,66 @@ function createRpc(store, api, systemNotifier = showSystemNotification, listWork
         return store.deleteFlow(args.flowId);
       case "flows.run.save":
         return store.saveFlowRun(cleanText(args.flowId, 64), args.run);
+      case "policies.list":
+        return { items: await store.listPolicies() };
+      case "policies.save": {
+        // 先对归一化草稿做校验（数字仓库 ID / 回写状态名），再落库，避免非法规则被持久化。
+        const source = args.policy && typeof args.policy === "object" ? args.policy : {};
+        const draft = normalizePolicy({ ...source, id: cleanText(source.id, 64) || "draft", name: cleanText(source.name, 200) || "draft" });
+        if (!draft) throw new YunxiaoError("规则名称不能为空", 422);
+        await validatePolicy(draft);
+        const saved = await store.savePolicy(source);
+        engine?.reschedule();
+        return saved;
+      }
+      case "policies.delete": {
+        const removed = await store.deletePolicy(args.policyId);
+        engine?.reschedule();
+        return removed;
+      }
+      case "policies.reorder": {
+        const ordered = await store.reorderPolicies(args.ids);
+        engine?.reschedule();
+        return { items: ordered };
+      }
+      case "policies.test":
+        return testPolicy(args.policy);
+      case "runs.list": {
+        const items = (await store.listRuns()).filter((run) => {
+          if (cleanText(args.policyId, 64) && run.policyId !== cleanText(args.policyId, 64)) return false;
+          if (cleanText(args.status, 30) && run.status !== cleanText(args.status, 30)) return false;
+          if (cleanText(args.defectId, 128) && run.defectId !== cleanText(args.defectId, 128)) return false;
+          return true;
+        });
+        return { items };
+      }
+      case "runs.get": {
+        const run = await store.getRun(args.runId);
+        if (!run) throw new YunxiaoError("运行记录不存在", 404);
+        return run;
+      }
+      case "runs.cancel": {
+        if (!engine?.isAvailable()) throw new YunxiaoError("规则引擎不可用，无法取消运行", 503);
+        return engine.cancelRun(cleanText(args.runId, 64));
+      }
+      case "runs.retry": {
+        if (!engine?.isAvailable()) throw new YunxiaoError("规则引擎不可用，无法重试", 503);
+        const run = await store.getRun(args.runId);
+        if (!run) throw new YunxiaoError("运行记录不存在", 404);
+        return engine.retryRun(run);
+      }
+      case "runs.confirm": {
+        if (!engine?.isAvailable()) throw new YunxiaoError("规则引擎不可用，无法裁决", 503);
+        return engine.confirmRun(cleanText(args.runId, 64), cleanText(args.decision, 30));
+      }
+      case "engine.status":
+        return engine
+          ? engine.status()
+          : { available: false, scanning: false, queued: 0, lastScanAt: "", lastScanError: "引擎服务未注入", active: [] };
+      case "engine.scanNow": {
+        if (!engine?.isAvailable()) throw new YunxiaoError("规则引擎不可用", 503);
+        return engine.scanOnce();
+      }
       default:
         throw new YunxiaoError(`未知操作：${cleanText(method, 100)}`, 404);
     }
@@ -2390,8 +3594,13 @@ function apply(ctx, suppliedConfig = {}) {
   const store = createJsonStore(config.dataFile, config.cacheMaxItems);
   const api = createApiClient(config);
 
-  // 读取 Harness 的工作区注册表（workspaceRegistry）供设置页绑定与校验；
-  // 服务缺失或未启动时返回空列表，不影响其余功能。
+  // 规则引擎：通知与系统渠道共用一套实现；引擎自身等 agents 等服务注入后再启动。
+  const engine = createPolicyEngine({
+    store,
+    api,
+    notify: (title, body, options) => showSystemNotification(title, body, { ...options, store })
+  });
+
   function listHarnessWorkspaces() {
     const reflect = ctx.reflect;
     if (!reflect || typeof reflect.get !== "function") return [];
@@ -2410,7 +3619,7 @@ function apply(ctx, suppliedConfig = {}) {
     }
   }
 
-  const rpc = createRpc(store, api, showSystemNotification, listHarnessWorkspaces);
+  const rpc = createRpc(store, api, showSystemNotification, listHarnessWorkspaces, engine);
   registerTools(ctx, rpc, config.timeoutMs);
 
   ctx.inject(["webServer"], (httpCtx) => {
@@ -2435,6 +3644,14 @@ function apply(ctx, suppliedConfig = {}) {
       }
     }), "dsh-yunxiao: rpc route");
   });
+
+  // 规则引擎按需启动：六个服务任一缺失（profile 组成不同）回调不触发，引擎保持停用。
+  ctx.inject(["agents", "agentPresets", "permissionPresets", "sessionTitle", "workspaceRegistry", "attachments"], (svcCtx) => {
+    svcCtx.effect(() => {
+      engine.start(svcCtx);
+      return async () => engine.stop();
+    }, "dsh-yunxiao: policy engine");
+  });
 }
 
 export {
@@ -2454,6 +3671,11 @@ export {
   mapPipelineRun,
   normalizeFlow,
   normalizeFlows,
+  createPolicyEngine,
+  policyMatches,
+  normalizePolicy,
+  normalizeRun,
+  normalizeRunResult,
   isNotifiableDefectStatus,
   normalizeDefectNotification,
   normalizeSystemInfo,

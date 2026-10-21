@@ -1,7 +1,8 @@
 # 流程编排优化设计：规则驱动的缺陷自动处理引擎
 
-> 状态：设计稿（待评审） · 2026-10-20
+> 状态：已实施（P0/P1 主体落地，P2 增强项待做） · 2026-10-20 设计，2026-10-21 实施
 > 范围：d_yunxiao 插件的「编排」能力重构，从"客户端驱动的画布 DAG"升级为"宿主侧规则引擎 + 分级自治的缺陷自动修复闭环"。
+> 实施说明：与设计稿的差异 —— ① `REPORT_OUTCOMES` 增加 `analyzed`（分析模式终态）；② 取消智能体用 `agent.cancel({kind:"user"})`（对象而非字符串，以 dsh-agent runtime-types 为准）；③ `analyze-confirm` 的只读权限预设按部署动态探测（read-only → 任意 sandbox=read-only → 回退默认预设），未配置 `auto-fix` 时实现阶段同样动态回退；④ `match.labelAny` 暂不参与匹配（缺陷列表接口不返回标签），UI 隐藏该输入；⑤ MR 后流水线联动已实现（createPipelineRun + 轮询至终态）。P2 待做：LLM 分诊、agents.resume 断点续跑、旧画布移除。
 
 ---
 

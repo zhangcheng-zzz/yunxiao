@@ -72,38 +72,6 @@ var FLOW_NODE_TYPES = {
     fields: [{ k: "tpl", l: "内容模板", o: ["处理摘要", "诊断结论"] }],
     sub: function (n) { return "回写：" + (n.cfg.tpl || "处理摘要"); } }
 };
-var FLOW_DEFAULT_TEMPLATES = [
-  { name: "缺陷自动修复流", on: false, autoRun: true, trg: "缺陷单流转", nodes: [
-    { id: "n1", tp: "trg-item", name: "缺陷状态变更", x: 8, y: 20, cfg: { tp: "缺陷", ev: "待确认 / 再次打开" } },
-    { id: "n2", tp: "op-cond", name: "优先级 ≤ P1？", x: 196, y: 20, cfg: { f: "优先级", op: "≤", v: "P1" } },
-    { id: "n3", tp: "act-agent", name: "DSH 自动处理", x: 384, y: 20, cfg: { task: "缺陷修复", mode: "直接发送" } },
-    { id: "n4", tp: "act-mr", name: "创建合并请求", x: 384, y: 168, cfg: { note: "在 Codeup 从修复分支发起 MR" } },
-    { id: "n5", tp: "act-scan", name: "代码检测卡点", x: 196, y: 168, cfg: { gate: "0 个严重问题" } },
-    { id: "n6", tp: "act-pipe", name: "运行流水线", x: 8, y: 168, cfg: { pipe: "", br: "自动" } },
-    { id: "n7", tp: "act-test", name: "执行测试计划", x: 196, y: 316, cfg: { plan: "", gate: "90%" } },
-    { id: "n8", tp: "act-item", name: "更新缺陷状态", x: 384, y: 316, cfg: { st: "已修复", cmt: "开" } },
-    { id: "n9", tp: "ntf-msg", name: "通知验收", x: 196, y: 464, cfg: { tpl: "验收提醒" } },
-    { id: "n10", tp: "ntf-msg", name: "转人工处理", x: 8, y: 464, cfg: { tpl: "人工处理提醒" } }
-  ], edges: [
-    { f: "n1", t: "n2" }, { f: "n2", t: "n3", label: "是" }, { f: "n2", t: "n10", label: "否" },
-    { f: "n3", t: "n4" }, { f: "n4", t: "n5" }, { f: "n5", t: "n6" },
-    { f: "n6", t: "n7" }, { f: "n7", t: "n8" }, { f: "n8", t: "n9" }
-  ] },
-  { name: "流水线失败自愈", on: false, autoRun: false, trg: "流水线失败", nodes: [
-    { id: "m1", tp: "trg-pipe", name: "流水线失败", x: 8, y: 40, cfg: { pipe: "", ev: "失败" } },
-    { id: "m2", tp: "act-agent", name: "DSH 日志诊断", x: 196, y: 40, cfg: { task: "日志诊断", mode: "直接发送" } },
-    { id: "m3", tp: "op-cond", name: "能定位根因？", x: 384, y: 40, cfg: { f: "根因定位", op: "=", v: "成功" } },
-    { id: "m4", tp: "ntf-comment", name: "回写诊断结论", x: 384, y: 190, cfg: { tpl: "诊断结论" } },
-    { id: "m5", tp: "ntf-msg", name: "通知负责人", x: 196, y: 190, cfg: { tpl: "人工处理提醒" } }
-  ], edges: [
-    { f: "m1", t: "m2" }, { f: "m2", t: "m3" },
-    { f: "m3", t: "m4", label: "是" }, { f: "m3", t: "m5", label: "否" }
-  ] },
-  { name: "空白编排", on: false, autoRun: false, trg: "手动", nodes: [
-    { id: "e1", tp: "trg-item", name: "触发器", x: 16, y: 40, cfg: { tp: "缺陷", ev: "任意状态变更" } }
-  ], edges: [] }
-];
-
 function flowNodeSub(node) {
   var type = FLOW_NODE_TYPES[node.tp];
   return type ? String(type.sub(node) || type.name) : "";
@@ -128,7 +96,7 @@ function clampFlowNode(value) {
   };
 }
 
-// 从服务端流程定义重建一份可编辑副本（含缺省字段），避免直接改到持久化对象。
+// 从服务端流程定义重建一份展示副本（含缺省字段），避免直接改到持久化对象。
 function hydrateFlow(serverFlow) {
   var source = serverFlow && typeof serverFlow === "object" ? serverFlow : {};
   var nodes = (Array.isArray(source.nodes) ? source.nodes : []).map(clampFlowNode).filter(Boolean);
@@ -153,10 +121,6 @@ function hydrateFlow(serverFlow) {
     edges: edges,
     runs: (Array.isArray(source.runs) ? source.runs : []).slice(0, 30)
   };
-}
-
-function newFlowId() {
-  return "f" + Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
 }
 
 var CSS = [
@@ -303,12 +267,16 @@ var CSS = [
   ".dyx-expand{width:30px;min-height:30px;padding:0;border:0;border-radius:9px;color:var(--dyx-muted);background:transparent;cursor:pointer;font:inherit;font-size:14px;line-height:1}.dyx-expand:hover{color:var(--dyx-brand);background:var(--dyx-brand-weak)}",
   // 全页模式：面板宽度由 applyPanelWidth 动态计算（100vw - 聊天保留宽），禁用拖拽手柄。
   ".dyx-root[data-full='true'] .dyx-resize-handle{display:none}",
-  // 编排画布：左侧节点面板 + 右侧可拖拽画布；节点绝对定位，连线画在同一坐标系的 SVG 里。
-  ".dyx-flow-shell{display:grid;grid-template-columns:186px minmax(0,1fr);gap:0;border-radius:16px;background:var(--dyx-panel);box-shadow:var(--dyx-shadow-sm);overflow:hidden}",
-  ".dyx-flow-palette{padding:12px 10px;overflow:auto;max-height:640px;border-right:1px solid var(--dyx-line);scrollbar-width:thin}",
-  ".dyx-flow-palette h4{margin:10px 0 6px;color:var(--dyx-muted);font-size:11.5px;font-weight:600}.dyx-flow-palette h4:first-child{margin-top:0}",
-  ".dyx-flow-pi{display:flex;align-items:center;gap:8px;width:100%;min-height:38px;margin-bottom:4px;padding:6px 8px;border:0;border-radius:10px;background:transparent;cursor:pointer;text-align:left;font:inherit;font-size:12.5px;color:var(--dyx-text)}.dyx-flow-pi:hover{background:var(--dyx-brand-weak)}",
-  ".dyx-flow-pi span{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}",
+  // 编排画布：旧画布只读展示（节点面板已随客户端执行引擎移除）。
+  ".dyx-flow-shell{border-radius:16px;background:var(--dyx-panel);box-shadow:var(--dyx-shadow-sm);overflow:hidden}",
+  ".dyx-flow-readonly-note{margin:0;padding:10px 14px;border-bottom:1px solid var(--dyx-line);border-radius:0}",
+  // 编排子页签（规则 / 运行记录 / 待确认 / 旧版画布），复用导航按钮的观感但更轻量。
+  ".dyx-flow-subtabs{display:flex;gap:6px;flex-wrap:wrap;margin:12px 0}.dyx-flow-subtabs button{display:inline-flex;align-items:center;gap:6px;min-height:34px;padding:6px 14px;border:0;border-radius:999px;background:var(--dyx-tag);cursor:pointer;font:inherit;font-size:12.5px;color:var(--dyx-muted)}.dyx-flow-subtabs button:hover{background:var(--dyx-hover)}.dyx-flow-subtabs button.active{background:var(--dyx-brand-weak);color:var(--dyx-brand);font-weight:600}",
+  // 规则编辑抽屉：fieldset 分组（触发 / 匹配 / 处理方式 / 提交与回写）。
+  ".dyx-policy-form{display:flex;flex-direction:column;gap:14px}",
+  ".dyx-policy-group{margin:0;padding:12px 14px 14px;border:1px solid var(--dyx-line);border-radius:14px;background:var(--dyx-panel2)}",
+  ".dyx-policy-group legend{padding:0 6px;color:var(--dyx-muted);font-size:11.5px;font-weight:600}",
+  ".dyx-policy-group .dyx-field{margin-top:10px}.dyx-policy-group .dyx-notify-toggle{margin-right:10px}",
   ".dyx-flow-glyph{width:24px;height:24px;flex:none;display:grid;place-items:center;border-radius:8px;color:#fff;font-size:13px}",
   ".dyx-flow-canvas{position:relative;height:640px;overflow:auto;background:radial-gradient(circle,var(--dyx-line) 1px,transparent 1px);background-size:18px 18px;scrollbar-width:thin;touch-action:none}",
   ".dyx-flow-stage{position:relative;min-width:640px;min-height:600px;height:100%}",
@@ -857,7 +825,10 @@ function createWorkspace(onRequestClose, notifier, services) {
     code: { repos: [], total: 0, page: 1, pageSize: PAGE_SIZE, keyword: "", loaded: false, detail: null },
     tests: { plans: [], total: 0, page: 1, pageSize: PAGE_SIZE, loaded: false },
     packages: { repos: [], total: 0, page: 1, pageSize: PAGE_SIZE, loaded: false },
-    flows: { items: [], loaded: false, active: 0, sel: "", connectFrom: "", selEdge: -1, run: null, runCtx: null },
+    flows: { items: [], loaded: false, active: 0, sel: "", sub: "rules" },
+    policies: { items: [], loaded: false },
+    runs: { items: [], loaded: false, status: "" },
+    engine: { status: null },
     open: false
   };
   var root;
@@ -936,7 +907,15 @@ function createWorkspace(onRequestClose, notifier, services) {
     if (tab === "code" && !state.code.loaded) loadCodeRepos();
     if (tab === "tests" && !state.tests.loaded) loadTestPlans();
     if (tab === "packages" && !state.packages.loaded) loadPackageRepos();
-    if (tab === "flows" && !state.flows.loaded) loadFlows();
+    if (tab === "flows") {
+      if (!state.flows.loaded) loadFlows();
+      if (!state.policies.loaded) loadPolicies();
+      loadRuns();
+      loadEngineStatus();
+      startFlowsPolling();
+    } else {
+      stopFlowsPolling();
+    }
   }
 
   function loadWorkspaces() {
@@ -2314,7 +2293,12 @@ function createWorkspace(onRequestClose, notifier, services) {
     var refresh = Promise.all([
       rpc("defect.notification.scan", rpcArgs({})).catch(function () { return null; }),
       rpc("pipelines.list", rpcArgs({ page: 1, pageSize: 20 })).catch(function () { return null; }),
-      loadFlows().catch(function () { return null; })
+      loadFlows().catch(function () { return null; }),
+      rpc("policies.list", {}).then(function (result) {
+        state.policies.items = result.items || [];
+        state.policies.loaded = true;
+        return state.policies.items;
+      }).catch(function () { return null; })
     ]).then(function (values) {
       state.dashboard = { loaded: true, scan: values[0], pipelines: values[1] };
       render();
@@ -2338,6 +2322,7 @@ function createWorkspace(onRequestClose, notifier, services) {
     var failedPipelines = pipelineItems.filter(function (item) { return statusClass(item.status) === "fail"; }).length;
     var runningPipelines = pipelineItems.filter(function (item) { return statusClass(item.status) === "run"; }).length;
     var flowsEnabled = state.flows.items.filter(function (item) { return item.on; }).length;
+    var policiesEnabled = state.policies.items.filter(function (item) { return item.enabled; }).length;
     var binding = account && account.workspace || null;
     // 统计条：与各列表页同款固定宽度方格小卡，点击直达对应页签。
     var strip = node("div", "dyx-statstrip");
@@ -2346,7 +2331,7 @@ function createWorkspace(onRequestClose, notifier, services) {
       statTile({ label: "全部流水线", value: pipelineTotal, hint: "读取 " + pipelineItems.length + " 条", onClick: function () { setTab("pipelines"); } }),
       statTile({ label: "运行中", tone: "run", value: runningPipelines, hint: "流水线", onClick: function () { setTab("pipelines"); } }),
       statTile({ label: "最近失败", tone: failedPipelines ? "fail" : "", value: failedPipelines, hint: failedPipelines ? "可交给自愈编排" : "暂无失败运行", onClick: function () { setTab("pipelines"); } }),
-      statTile({ label: "启用的编排", tone: flowsEnabled ? "ok" : "", value: flowsEnabled, hint: state.flows.items.length ? "共 " + state.flows.items.length + " 条流程" : "还没有编排", onClick: function () { setTab("flows"); } }),
+      statTile({ label: "启用的编排规则", tone: policiesEnabled ? "ok" : "", value: policiesEnabled, hint: state.policies.loaded ? "规则驱动缺陷自动处理" : "编排页可查看", onClick: function () { setTab("flows"); } }),
       statTile({ label: "DSH 工作区", tone: binding ? "ok" : "", value: binding ? "已绑定" : "未绑定", hint: binding ? (binding.title || binding.id) : "绑定后可一键处理缺陷", onClick: function () { setTab("overview"); } })
     );
     section.append(strip);
@@ -2366,10 +2351,10 @@ function createWorkspace(onRequestClose, notifier, services) {
     var flowCard = node("div", "dyx-card");
     var flowHead = node("div", "dyx-card-head");
     var flowCopy = node("div", "dyx-card-title");
-    flowCopy.append(node("h3", "", "流程编排"), node("small", "", state.flows.items.length ? "共 " + state.flows.items.length + " 条 · " + flowsEnabled + " 条已启用" : "从模板一键创建"));
-    flowHead.append(flowCopy, button("进入画布", "primary", function () { setTab("flows"); }));
+    flowCopy.append(node("h3", "", "流程编排"), node("small", "", state.flows.items.length ? "旧版画布 " + state.flows.items.length + " 条（只读） · 规则 " + policiesEnabled + " 条已启用" : "在编排页配置处理规则"));
+    flowHead.append(flowCopy, button("管理规则", "primary", function () { setTab("flows"); }));
     flowCard.append(flowHead);
-    if (!state.flows.items.length) flowCard.append(empty("还没有编排", "从模板一键创建：缺陷自动修复、流水线失败自愈等。"));
+    if (!state.flows.items.length) flowCard.append(empty("没有旧版画布编排", "在「编排」页用规则驱动缺陷自动处理。"));
     else flowCard.append(flowGrid(state.flows.items.slice(0, DASHBOARD_PREVIEW_LIMIT)));
     section.append(flowCard);
     main.append(section);
@@ -2385,6 +2370,7 @@ function createWorkspace(onRequestClose, notifier, services) {
       function openFlow() {
         var index = state.flows.items.indexOf(flow);
         if (index >= 0) { state.flows.active = index; state.flows.sel = ""; state.flows.selEdge = -1; }
+        state.flows.sub = "canvas";
         setTab("flows");
       }
       card.addEventListener("click", function (event) {
@@ -2806,126 +2792,735 @@ function createWorkspace(onRequestClose, notifier, services) {
     });
   }
 
-  function saveFlowSoon() {
-    if (saveFlowSoon.timer) clearTimeout(saveFlowSoon.timer);
-    saveFlowSoon.timer = setTimeout(function () {
-      saveFlowSoon.timer = null;
-      var flow = activeFlow();
-      if (!flow || !flow.id) return;
-      rpc("flows.save", { flow: flow }).catch(function (error) { toast("编排保存失败：" + error.message, true); });
-    }, 400);
+  // —— 编排：处理规则 / 运行台账 / 引擎状态（宿主引擎驱动，客户端只做展示与裁决）——
+  function loadPolicies() {
+    return rpc("policies.list", {}).then(function (result) {
+      state.policies.items = result.items || [];
+      state.policies.loaded = true;
+      if (state.tab === "flows") render();
+      return state.policies.items;
+    }).catch(function (error) {
+      toast("规则读取失败：" + error.message, true);
+    });
+  }
+
+  function loadRuns() {
+    return rpc("runs.list", rpcArgs({ status: state.runs.status })).then(function (result) {
+      state.runs.items = result.items || [];
+      state.runs.loaded = true;
+      if (state.tab === "flows") render();
+      return state.runs.items;
+    }).catch(function (error) {
+      toast("运行记录读取失败：" + error.message, true);
+    });
+  }
+
+  function loadEngineStatus() {
+    return rpc("engine.status", {}).then(function (status) {
+      state.engine.status = status;
+      if (state.tab === "flows") render();
+      return status;
+    }).catch(function () {
+      state.engine.status = null;
+      return null;
+    });
+  }
+
+  var flowsPollTimer = null;
+  function startFlowsPolling() {
+    if (flowsPollTimer) return;
+    // 编排页可见时轮询引擎状态，让"运行中/待确认"计数与运行状态自动刷新。
+    flowsPollTimer = setInterval(function () {
+      if (!root || state.tab !== "flows") return;
+      Promise.all([loadEngineStatus(), rpc("runs.list", rpcArgs({ status: state.runs.status }))]).then(function (values) {
+        state.runs.items = values[1].items || [];
+        render();
+      }).catch(function () {});
+    }, 15000);
+  }
+
+  function stopFlowsPolling() {
+    if (flowsPollTimer) { clearInterval(flowsPollTimer); flowsPollTimer = null; }
+  }
+
+  function setFlowsSub(sub) {
+    state.flows.sub = sub;
+    render();
+    if (sub === "runs") loadRuns();
+    if (sub === "rules" && !state.policies.loaded) loadPolicies();
+  }
+
+  // —— 编排页：规则驱动的缺陷自动处理 ————————————————————————————————————————
+  // 执行全部在宿主引擎；客户端只负责规则编辑、运行台账展示与"待确认"裁决。
+  var POLICY_MODE_META = {
+    "auto-submit": { label: "全自动修复", tone: "ok", hint: "智能体在绑定工作区修复、验证并提交 MR" },
+    "analyze-confirm": { label: "先析后确认", tone: "run", hint: "只读诊断出根因与方案，批准后同一会话实施" },
+    "notify": { label: "仅通知", tone: "", hint: "只提醒负责人，不做任何自动处理" }
+  };
+  var RUN_STATUS_META = {
+    queued: ["排队中", "run"], fetching: ["读取缺陷", "run"], classifying: ["规则匹配", "run"],
+    "agent-running": ["智能体处理中", "run"], "awaiting-confirm": ["待确认", "wait"],
+    submitting: ["提交中", "run"], writeback: ["回写中", "run"],
+    succeeded: ["成功", "ok"], "needs-human": ["需人工", "fail"], failed: ["失败", "fail"],
+    skipped: ["已跳过", "skip"], canceled: ["已取消", "skip"], interrupted: ["已中断", "fail"]
+  };
+  var OUTCOME_META = { fixed: "已修复", analyzed: "已分析", "needs-human": "需人工", "not-a-bug": "非缺陷", "cannot-reproduce": "无法复现", blocked: "受阻" };
+  var POLICY_TEMPLATES = [
+    {
+      name: "样式 / 缺字段自动修复",
+      mode: "auto-submit",
+      match: { keywordsAny: ["样式", "错位", "字体", "颜色", "间距", "字段缺失", "缺少字段", "未显示", "不展示", "文案"], keywordsNone: ["支付", "结算", "退款"], priorityCeiling: "P2", typeAny: [] },
+      instructions: "只改前端展示与字段映射层，不改接口契约；缺失字段优先从现有接口返回/DTO 中取，取不到则以 needs-human 报告；样式遵循项目现有 UI 规范；修复说明附修改前后对照。",
+      submit: { baseBranch: "", branchPattern: "fix/{serial}-{slug}", push: true, createMr: true, mrTarget: "", mrTitle: "fix({serial}): {subject}", verifyCommands: [], maxChangedFiles: 30, forbiddenPaths: [] },
+      writeback: { comment: true, statusOnSuccess: "", statusOnConfirm: "", statusOnFailure: "", assigneeOnFailure: "" }
+    },
+    {
+      name: "C 端后台逻辑分析确认",
+      mode: "analyze-confirm",
+      match: { keywordsAny: ["接口", "数据不对", "报错", "500", "逻辑", "状态流转", "计算", "超时"], keywordsNone: [], priorityCeiling: "", typeAny: ["缺陷"] },
+      instructions: "本次只读诊断：定位根因、给出修复方案（含涉及文件清单）与风险影响面，不改任何代码；结论需包含验证思路。",
+      submit: { baseBranch: "", branchPattern: "fix/{serial}-{slug}", push: true, createMr: true, mrTarget: "", mrTitle: "fix({serial}): {subject}", verifyCommands: [], maxChangedFiles: 30, forbiddenPaths: [] },
+      writeback: { comment: true, statusOnSuccess: "", statusOnConfirm: "", statusOnFailure: "", assigneeOnFailure: "" }
+    }
+  ];
+
+  function policyModeBadge(mode) {
+    var meta = POLICY_MODE_META[mode] || POLICY_MODE_META["analyze-confirm"];
+    return node("span", "dyx-badge " + meta.tone, meta.label);
+  }
+
+  function runBadge(status) {
+    var meta = RUN_STATUS_META[status] || [status || "未知", ""];
+    return node("span", "dyx-badge " + meta[1], meta[0]);
+  }
+
+  function policyScopeLabel(policy) {
+    var scope = policy.scope || {};
+    if (!scope.accountId && !scope.projectId) return "跟随当前账号与项目";
+    var account = (state.server.accounts || []).find(function (item) { return item.id === scope.accountId; });
+    var project = account && account.selectedProject;
+    return (account ? account.name : "指定账号") + " · " + (scope.projectId ? (project && project.id === scope.projectId ? project.name : scope.projectId) : "当前项目");
+  }
+
+  function policyMatchSummary(policy) {
+    var match = policy.match || {};
+    var parts = [];
+    if ((match.keywordsAny || []).length) parts.push("含：" + match.keywordsAny.slice(0, 4).join("、") + (match.keywordsAny.length > 4 ? " 等" : ""));
+    if ((match.keywordsNone || []).length) parts.push("排除：" + match.keywordsNone.slice(0, 3).join("、") + (match.keywordsNone.length > 3 ? " 等" : ""));
+    if (match.priorityCeiling) parts.push("优先级 ≤ " + match.priorityCeiling);
+    if ((match.typeAny || []).length) parts.push("类型：" + match.typeAny.join("、"));
+    return parts.join(" · ");
   }
 
   function renderFlows() {
     var section = node("section", "dyx-section dyx-flow-section");
-    var flow = activeFlow();
     var title = node("div", "dyx-title");
     var copy = node("div");
-    copy.append(node("h2", "", "编排"), node("p", "", "把云效事件、DSH 智能体与流水线/工作项/通知串成一条流；拖拽节点连线，运行时按连线逐步执行。"));
+    copy.append(node("h2", "", "编排"), node("p", "", "输入处理规则后由宿主引擎自动执行：命中规则的缺陷按模式分级处理——样式/缺字段全自动修复提交，后台逻辑先析后确认，其余仅通知；结果与 MR 自动回写缺陷。"));
     title.append(copy);
-    var titleActions = node("div", "dyx-actions");
-    var selector = node("select", "dyx-select");
-    selector.setAttribute("aria-label", "选择编排");
-    if (!state.flows.items.length) {
-      var placeholder = node("option", "", "暂无编排");
-      selector.append(placeholder);
-    } else {
-      state.flows.items.forEach(function (item, index) {
-        var option = node("option", "", item.name);
-        option.value = String(index);
-        if (index === state.flows.active) option.selected = true;
-        selector.append(option);
-      });
-    }
-    selector.addEventListener("change", function () {
-      state.flows.active = Number(selector.value) || 0;
-      state.flows.sel = "";
-      state.flows.selEdge = -1;
-      render();
-    });
-    titleActions.append(selector);
-    if (flow) {
-      var enableToggle = input("checkbox");
-      enableToggle.checked = Boolean(flow.on);
-      enableToggle.setAttribute("aria-label", "启用编排");
-      var enableWrap = node("label", "dyx-notify-toggle dyx-flow-enable");
-      var enableCopy = node("span");
-      enableCopy.append(node("strong", "", "启用"));
-      enableWrap.append(enableCopy, enableToggle);
-      enableToggle.addEventListener("change", function () {
-        flow.on = enableToggle.checked;
-        saveFlowSoon();
-      });
-      var autoToggle = input("checkbox");
-      autoToggle.checked = Boolean(flow.autoRun);
-      autoToggle.setAttribute("aria-label", "缺陷新增时自动运行");
-      var autoWrap = node("label", "dyx-notify-toggle dyx-flow-enable");
-      var autoCopy = node("span");
-      autoCopy.append(node("strong", "", "缺陷自动触发"));
-      autoWrap.append(autoCopy, autoToggle);
-      autoToggle.addEventListener("change", function () {
-        flow.autoRun = autoToggle.checked;
-        saveFlowSoon();
-        toast(flow.autoRun ? "新增待处理缺陷时将自动运行该编排" : "已关闭自动触发");
-      });
-      titleActions.append(enableWrap, autoWrap);
-      titleActions.append(button("模板重建", "", function () {
-        if (!window.confirm("用同名模板重建当前编排？当前画布会被覆盖。")) return;
-        var template = FLOW_DEFAULT_TEMPLATES.find(function (item) { return item.name === flow.name; });
-        var rebuilt = template
-          ? hydrateFlow(Object.assign({}, template, { id: flow.id, name: flow.name, on: flow.on, autoRun: flow.autoRun, runs: flow.runs }))
-          : hydrateFlow(Object.assign({}, FLOW_DEFAULT_TEMPLATES[2], { id: flow.id, name: flow.name, on: flow.on, autoRun: flow.autoRun, runs: flow.runs }));
-        Object.assign(flow, rebuilt);
-        state.flows.run = null;
-        saveFlowSoon();
-        render();
-      }));
-      titleActions.append(button("新建编排", "", function () {
-        var template = hydrateFlow(Object.assign({}, FLOW_DEFAULT_TEMPLATES[2], { id: newFlowId(), name: "编排 " + (state.flows.items.length + 1) }));
-        state.flows.items.unshift(template);
-        state.flows.active = 0;
-        state.flows.run = null;
-        saveFlowSoon();
-        render();
-      }));
-      titleActions.append(button("删除编排", "danger", function () {
-        if (!window.confirm("删除编排\"" + flow.name + "\"及其运行记录？")) return;
-        var removing = flow;
-        rpc("flows.delete", { flowId: flow.id }).catch(function () {}).then(function () {
-          var index = state.flows.items.indexOf(removing);
-          if (index >= 0) state.flows.items.splice(index, 1);
-          state.flows.active = 0;
-          state.flows.run = null;
-          if (state.flows.items.length) return rpc("flows.save", { flow: activeFlow() }).catch(function () {});
-        }).then(function () { render(); toast("编排已删除"); });
-      }));
-      titleActions.append(button("运行记录", "", function () { openFlowRuns(flow); }));
-      titleActions.append(button("运行", "primary", function () { startFlowRun(flow, null); }));
-    }
-    title.append(titleActions);
     section.append(title);
     if (!renderRequirement(section)) { main.append(section); return; }
-    if (!flow) {
+    var sub = state.flows.sub || "rules";
+    var runsAll = state.runs.items;
+    var inboxCount = runsAll.filter(function (run) { return run.status === "awaiting-confirm"; }).length;
+    var engineStatus = state.engine.status;
+    var activeCount = engineStatus ? engineStatus.active.length + (engineStatus.queued || 0) : 0;
+    var todayKey = new Date().toDateString();
+    var todayCount = runsAll.filter(function (run) {
+      return ["succeeded", "needs-human", "failed"].indexOf(run.status) >= 0 && run.endedAt && new Date(run.endedAt).toDateString() === todayKey;
+    }).length;
+    var openCount = runsAll.filter(function (run) { return run.status === "failed" || run.status === "needs-human"; }).length;
+    var enabledCount = state.policies.items.filter(function (item) { return item.enabled; }).length;
+    var strip = node("div", "dyx-statstrip");
+    strip.append(
+      statTile({ label: "启用规则", tone: enabledCount ? "ok" : "", value: enabledCount, hint: "共 " + state.policies.items.length + " 条规则", onClick: function () { setFlowsSub("rules"); } }),
+      statTile({ label: "运行中", tone: activeCount ? "run" : "", value: activeCount, hint: engineStatus && engineStatus.available ? "宿主引擎" : "引擎不可用", onClick: function () { setFlowsSub("runs"); } }),
+      statTile({ label: "待确认", tone: inboxCount ? "pending" : "", value: inboxCount, hint: "分析完成待裁决", onClick: function () { setFlowsSub("inbox"); } }),
+      statTile({ label: "今日完成", value: todayCount, hint: "成功 / 需人工 / 失败", onClick: function () { setFlowsSub("runs"); } }),
+      statTile({ label: "需处理", tone: openCount ? "fail" : "", value: openCount, hint: "失败与需人工，可重试", onClick: function () { setFlowsSub("runs"); } })
+    );
+    section.append(strip);
+    var tabs = node("div", "dyx-flow-subtabs");
+    [["rules", "规则"], ["runs", "运行记录"], ["inbox", "待确认" + (inboxCount ? "（" + inboxCount + "）" : "")], ["canvas", "旧版画布"]].forEach(function (item) {
+      var tab = node("button", item[0] === sub ? "active" : "");
+      tab.type = "button";
+      tab.append(node("span", "", item[1]));
+      tab.addEventListener("click", function () { setFlowsSub(item[0]); });
+      tabs.append(tab);
+    });
+    section.append(tabs);
+    if (sub === "rules") renderPoliciesPage(section);
+    else if (sub === "runs") renderRunsPage(section);
+    else if (sub === "inbox") renderInboxPage(section);
+    else renderLegacyCanvasPage(section);
+    main.append(section);
+    // 连线绘制依赖 DOM 尺寸，必须在挂载后执行。
+    if (sub === "canvas") drawFlowEdges();
+  }
+
+  function renderPoliciesPage(section) {
+    var actions = node("div", "dyx-actions");
+    actions.append(button("刷新", "", function () { loadPolicies(); }));
+    POLICY_TEMPLATES.forEach(function (template) {
+      actions.append(button("模板：" + template.name, "", function () { openPolicyDrawer(null, template); }));
+    });
+    actions.append(button("新建空白规则", "primary", function () { openPolicyDrawer(null, null); }));
+    section.append(actions);
+    if (!state.policies.items.length) {
       var starter = node("div", "dyx-card");
-      starter.append(empty("还没有编排", "从模板开始：把缺陷自动修复、流水线失败自愈串成一条流。"));
-      FLOW_DEFAULT_TEMPLATES.slice(0, 2).forEach(function (template) {
-        starter.append(button("从模板创建：" + template.name, "primary", function () {
-          var created = hydrateFlow(Object.assign({}, template, { id: newFlowId() }));
-          state.flows.items.unshift(created);
-          state.flows.active = 0;
-          saveFlowSoon();
-          render();
-        }));
-      });
+      starter.append(empty("还没有处理规则", "从上面的模板开始；规则保存后引擎按周期自动扫描命中缺陷。命中的先后顺序即列表顺序（上移/下移调整）。"));
       section.append(starter);
-      main.append(section);
+      return;
+    }
+    var grid = node("div", "dyx-record-list dyx-tile-grid");
+    state.policies.items.forEach(function (policy, index) { grid.append(policyCard(policy, index)); });
+    section.append(grid);
+  }
+
+  function policyCard(policy, index) {
+    var card = node("article", "dyx-record dyx-record-clickable dyx-tile-card" + (policy.enabled ? " tone-ok" : ""));
+    var head = node("div", "dyx-record-head");
+    head.append(policyModeBadge(policy.mode), node("span", "dyx-badge", policy.enabled ? "已启用" : "已停用"));
+    var title = node("button", "dyx-link dyx-record-title", policy.name);
+    title.type = "button";
+    title.title = policy.name;
+    title.addEventListener("click", function () { openPolicyDrawer(policy, null); });
+    var meta = node("div", "dyx-record-meta");
+    meta.append(node("span", "", policyScopeLabel(policy) + " · 每 " + policy.trigger.pollMinutes + " 分钟"));
+    var matchText = policyMatchSummary(policy);
+    if (matchText) meta.append(node("span", "", matchText));
+    if (policy.instructions) meta.append(node("span", "", String(policy.instructions).slice(0, 60) + (String(policy.instructions).length > 60 ? "…" : "")));
+    var lastRun = state.runs.items.find(function (run) { return run.policyId === policy.id; });
+    var foot = node("div", "dyx-record-foot");
+    foot.append(node("span", "dyx-muted", lastRun
+      ? "最近 " + runBadge(lastRun.status).textContent + " · " + shortDateTime(lastRun.startedAt) + " · " + (lastRun.serial || "")
+      : "暂无运行"));
+    var actions = node("div", "dyx-actions");
+    var toggle = input("checkbox");
+    toggle.checked = Boolean(policy.enabled);
+    toggle.setAttribute("aria-label", "启用规则");
+    var toggleWrap = node("label", "dyx-notify-toggle");
+    toggleWrap.append(node("span", "", "启用"), toggle);
+    toggle.addEventListener("change", function () {
+      var next = toggle.checked;
+      setBusy(card, true);
+      rpc("policies.save", { policy: Object.assign({}, policy, { enabled: next }) }).then(function () {
+        toast(next ? "规则已启用，引擎将按周期扫描" : "规则已停用");
+        loadPolicies();
+      }).catch(function (error) {
+        toast("保存失败：" + error.message, true);
+      }).then(function () { setBusy(card, false); });
+    });
+    actions.append(toggleWrap);
+    actions.append(button("试运行", "", function () { testPolicyMatches(policy); }));
+    actions.append(button("编辑", "", function () { openPolicyDrawer(policy, null); }));
+    if (index > 0) actions.append(button("↑", "", function () { movePolicy(index, index - 1); }));
+    if (index < state.policies.items.length - 1) actions.append(button("↓", "", function () { movePolicy(index, index + 1); }));
+    actions.append(button("删除", "danger", function () {
+      if (!window.confirm("删除规则「" + policy.name + "」？历史运行记录保留。")) return;
+      rpc("policies.delete", { policyId: policy.id }).then(function () {
+        toast("规则已删除");
+        loadPolicies();
+      }).catch(function (error) { toast("删除失败：" + error.message, true); });
+    }));
+    foot.append(actions);
+    card.append(head, title, meta, foot);
+    return card;
+  }
+
+  function movePolicy(from, to) {
+    var ids = state.policies.items.map(function (item) { return item.id; });
+    var moved = ids.splice(from, 1)[0];
+    ids.splice(to, 0, moved);
+    rpc("policies.reorder", { ids: ids }).then(function () { loadPolicies(); }).catch(function (error) {
+      toast("排序失败：" + error.message, true);
+    });
+  }
+
+  // 规则编辑抽屉：分"触发 / 匹配 / 处理方式 / 提交与回写"四组；保存前宿主会校验
+  // MR 仓库 ID 与回写状态名。scope 跟随当前账号/项目时存空值。
+  function openPolicyDrawer(policy, template) {
+    var isDraft = !policy;
+    var base = policy ? JSON.parse(JSON.stringify(policy)) : JSON.parse(JSON.stringify(Object.assign({
+      id: "",
+      name: "",
+      enabled: true,
+      scope: { accountId: "", projectId: "" },
+      trigger: { statusKinds: ["pending", "reopened"], assigneeId: "", pollMinutes: 5, backfill: false },
+      match: { keywordsAny: [], keywordsNone: [], priorityCeiling: "", typeAny: [] },
+      mode: "analyze-confirm",
+      instructions: "",
+      agent: { preset: "", permissionPreset: "", model: "", maxMinutes: 30 },
+      submit: { repoId: "", repoPath: "", baseBranch: "", branchPattern: "fix/{serial}-{slug}", push: true, createMr: true, mrTarget: "", mrTitle: "fix({serial}): {subject}", pipelineId: "", verifyCommands: [], maxChangedFiles: 30, forbiddenPaths: [] },
+      writeback: { comment: true, statusOnSuccess: "", statusOnConfirm: "", statusOnFailure: "", assigneeOnFailure: "" },
+      concurrency: 2
+    }, template || {})));
+    var dialog = modal(isDraft ? "新建处理规则" : "编辑规则：" + policy.name, true);
+    var followScope = !base.scope.accountId && !base.scope.projectId;
+
+    function group(titleText) {
+      var box = node("fieldset", "dyx-policy-group");
+      box.append(node("legend", "", titleText));
+      return box;
+    }
+    function textField(labelText, value, placeholder, onChange) {
+      var control = input("text", placeholder || "", value || "");
+      control.addEventListener("change", function () { onChange(control.value.trim()); });
+      return field(labelText, control);
+    }
+    function numberField(labelText, value, min, max, onChange) {
+      var control = input("number", "", String(value == null ? "" : value));
+      control.min = String(min);
+      control.max = String(max);
+      control.addEventListener("change", function () { onChange(clampNumber(control.value, min, max)); });
+      return field(labelText, control);
+    }
+    function areaField(labelText, value, placeholder, onChange) {
+      var control = input("textarea", placeholder || "", (value || []).join("，"));
+      control.rows = 2;
+      control.addEventListener("change", function () {
+        onChange(control.value.split(/[\n,，;；]/).map(function (item) { return item.trim(); }).filter(Boolean));
+      });
+      return field(labelText, control);
+    }
+    function checkField(labelText, checked, onChange) {
+      var control = input("checkbox");
+      control.checked = Boolean(checked);
+      control.addEventListener("change", function () { onChange(control.checked); });
+      var wrap = node("label", "dyx-notify-toggle");
+      wrap.append(node("span", "", labelText), control);
+      return wrap;
+    }
+    function selectField(labelText, options, value, onChange) {
+      var control = node("select", "dyx-select");
+      options.forEach(function (option) {
+        var element = node("option", "", option.label);
+        element.value = option.value;
+        if (option.value === value) element.selected = true;
+        control.append(element);
+      });
+      control.addEventListener("change", function () { onChange(control.value); });
+      return field(labelText, control);
+    }
+    function statusNameOptions() {
+      return [{ value: "", label: "（不流转）" }].concat((state.defectStatusOptions || []).map(function (item) {
+        return { value: item.name, label: item.name };
+      }));
+    }
+    function memberOptions() {
+      return [{ value: "", label: "（不变更）" }].concat((state.defectMembers || []).map(function (item) {
+        return { value: item.id, label: item.name };
+      }));
+    }
+
+    var head1 = group("触发范围");
+    var followToggle = checkField("跟随当前账号与项目", followScope, function (checked) {
+      followScope = checked;
+      scopeRows.forEach(function (row) { row.style.display = checked ? "none" : ""; });
+    });
+    var accountOptions = [{ value: "", label: "（选择账号）" }].concat((state.server.accounts || []).map(function (account) {
+      return { value: account.id, label: account.name };
+    }));
+    var projectRow = textField("项目 ID（留空取该账号当前项目）", base.scope.projectId, "", function (value) { base.scope.projectId = value; });
+    var accountRow = selectField("云效账号", accountOptions, base.scope.accountId, function (value) { base.scope.accountId = value; });
+    var scopeRows = [accountRow, projectRow];
+    scopeRows.forEach(function (row) { row.style.display = followScope ? "none" : ""; });
+    head1.append(followToggle, accountRow, projectRow);
+    var kindRow = node("div", "dyx-field");
+    kindRow.append(node("label", "", "触发状态"));
+    var kindWrap = node("div", "dyx-actions");
+    [["pending", "待确认"], ["reopened", "再次打开"]].forEach(function (item) {
+      kindWrap.append(checkField(item[1], (base.trigger.statusKinds || []).indexOf(item[0]) >= 0, function (checked) {
+        var kinds = base.trigger.statusKinds || [];
+        if (checked && kinds.indexOf(item[0]) < 0) kinds.push(item[0]);
+        if (!checked) base.trigger.statusKinds = kinds.filter(function (kind) { return kind !== item[0]; });
+      }));
+    });
+    kindRow.append(kindWrap);
+    head1.append(kindRow);
+    head1.append(numberField("轮询间隔（分钟）", base.trigger.pollMinutes, 1, 1440, function (value) { base.trigger.pollMinutes = value; }));
+    head1.append(checkField("处理存量缺陷（启用规则时已存在的也处理）", base.trigger.backfill, function (checked) { base.trigger.backfill = checked; }));
+
+    var head2 = group("匹配条件（全部满足才命中）");
+    head2.append(areaField("标题/描述包含关键词（任一）", base.match.keywordsAny, "样式，字段缺失，未显示", function (value) { base.match.keywordsAny = value; }));
+    head2.append(areaField("排除关键词（命中则不处理）", base.match.keywordsNone, "支付，结算", function (value) { base.match.keywordsNone = value; }));
+    head2.append(selectField("优先级上限", [
+      { value: "", label: "（不限）" },
+      { value: "P0", label: "P0" }, { value: "P1", label: "P0-P1" },
+      { value: "P2", label: "P0-P2" }, { value: "P3", label: "P0-P3" }
+    ], base.match.priorityCeiling, function (value) { base.match.priorityCeiling = value; }));
+    head2.append(areaField("工作项类型（留空不限）", base.match.typeAny, "缺陷", function (value) { base.match.typeAny = value; }));
+
+    var head3 = group("处理方式");
+    var modeRow = node("div", "dyx-field");
+    modeRow.append(node("label", "", "模式"));
+    var modeWrap = node("div", "dyx-actions");
+    Object.keys(POLICY_MODE_META).forEach(function (mode) {
+      modeWrap.append(checkField(POLICY_MODE_META[mode].label, base.mode === mode, function (checked) {
+        if (checked) {
+          base.mode = mode;
+          Array.from(modeWrap.querySelectorAll("input")).forEach(function (control) { control.checked = control.parentNode.textContent.indexOf(POLICY_MODE_META[mode].label) >= 0; });
+        }
+      }));
+    });
+    modeRow.append(modeWrap);
+    head3.append(modeRow, node("div", "dyx-note", POLICY_MODE_META[base.mode] ? POLICY_MODE_META[base.mode].hint : ""));
+    var instructions = input("textarea", "写给智能体的自由文本规则，会原样注入并最高优先级遵守", base.instructions);
+    instructions.rows = 4;
+    instructions.addEventListener("change", function () { base.instructions = instructions.value; });
+    head3.append(field("处理规则（注入智能体提示词）", instructions));
+    head3.append(numberField("智能体超时（分钟）", base.agent.maxMinutes, 1, 720, function (value) { base.agent.maxMinutes = value; }));
+    head3.append(textField("权限预设（留空自动选择无审批写入预设）", base.agent.permissionPreset, "auto-fix", function (value) { base.agent.permissionPreset = value; }));
+
+    var head4 = group("提交与回写");
+    head4.append(textField("Codeup 仓库数字 ID（创建 MR 必填）", base.submit.repoId, "创建合并请求接口要求数字 ID", function (value) { base.submit.repoId = value; }));
+    head4.append(textField("基分支（留空用仓库默认分支）", base.submit.baseBranch, "develop", function (value) { base.submit.baseBranch = value; }));
+    head4.append(textField("分支名模板", base.submit.branchPattern, "fix/{serial}-{slug}", function (value) { base.submit.branchPattern = value; }));
+    head4.append(textField("MR 目标分支（留空用仓库默认分支）", base.submit.mrTarget, "develop", function (value) { base.submit.mrTarget = value; }));
+    head4.append(textField("MR 标题模板", base.submit.mrTitle, "fix({serial}): {subject}", function (value) { base.submit.mrTitle = value; }));
+    head4.append(areaField("验证命令（逐条执行，失败不建 MR）", base.submit.verifyCommands, "pnpm lint，pnpm typecheck", function (value) { base.submit.verifyCommands = value; }));
+    head4.append(numberField("改动文件数上限", base.submit.maxChangedFiles, 1, 1000, function (value) { base.submit.maxChangedFiles = value; }));
+    head4.append(areaField("禁改路径（glob，命中即转人工）", base.submit.forbiddenPaths, "**/payment/**，.github/**", function (value) { base.submit.forbiddenPaths = value; }));
+    head4.append(checkField("结果评论回写到缺陷", base.writeback.comment, function (checked) { base.writeback.comment = checked; }));
+    head4.append(selectField("成功后状态流转到", statusNameOptions(), base.writeback.statusOnSuccess, function (value) { base.writeback.statusOnSuccess = value; }));
+    head4.append(selectField("分析完成后状态流转到（先析后确认）", statusNameOptions(), base.writeback.statusOnConfirm, function (value) { base.writeback.statusOnConfirm = value; }));
+    head4.append(selectField("失败后状态流转到", statusNameOptions(), base.writeback.statusOnFailure, function (value) { base.writeback.statusOnFailure = value; }));
+    head4.append(selectField("失败后改负责人为", memberOptions(), base.writeback.assigneeOnFailure, function (value) { base.writeback.assigneeOnFailure = value; }));
+
+    var form = node("div", "dyx-policy-form");
+    var nameControl = input("text", "规则名称", base.name);
+    nameControl.addEventListener("change", function () { base.name = nameControl.value.trim(); });
+    form.append(field("规则名称", nameControl), head1, head2, head3, head4);
+    dialog.body.append(node("div", "dyx-note", "匹配顺序 = 规则列表顺序，首个命中的规则生效；保存时宿主会校验 MR 仓库 ID 与回写状态名。"), form);
+
+    dialog.foot.append(button("试运行匹配", "", function () { testPolicyMatches(base); }));
+    dialog.foot.append(button("取消", "", dialog.close));
+    dialog.foot.append(button("保存规则", "primary", function () {
+      if (!base.name) { toast("请填写规则名称", true); return; }
+      if (followScope) { base.scope = { accountId: "", projectId: "" }; }
+      if (!(base.trigger.statusKinds || []).length) { toast("至少选择一个触发状态", true); return; }
+      setBusy(dialog.foot, true);
+      rpc("policies.save", { policy: base }).then(function () {
+        dialog.close();
+        toast("规则已保存");
+        loadPolicies();
+      }).catch(function (error) {
+        toast("保存失败：" + error.message, true);
+      }).then(function () { setBusy(dialog.foot, false); });
+    }));
+
+    // 状态名与负责人选项跟随规则绑定的项目；读取失败不阻塞编辑。
+    var scopeProjectId = base.scope.projectId || (selectedProject() && selectedProject().id) || "";
+    if (scopeProjectId) {
+      rpc("defect.statusOptions", rpcArgs({ projectId: scopeProjectId })).then(function (result) {
+        state.defectStatusOptions = result.items || [];
+        render();
+        if (!dialog.box.isConnected) return;
+        dialog.body.textContent = "";
+        dialog.body.append(node("div", "dyx-note", "匹配顺序 = 规则列表顺序，首个命中的规则生效；保存时宿主会校验 MR 仓库 ID 与回写状态名。"), form);
+      }).catch(function () {});
+      rpc("defect.members", rpcArgs({ projectId: scopeProjectId })).then(function (result) {
+        state.defectMembers = result.items || [];
+      }).catch(function () {});
+    }
+  }
+
+  function clampNumber(value, min, max) {
+    var parsed = Number.parseInt(String(value), 10);
+    if (!Number.isFinite(parsed)) return min;
+    return Math.min(max, Math.max(min, parsed));
+  }
+
+  function testPolicyMatches(policyLike) {
+    var dialog = modal("试运行匹配", true);
+    dialog.body.append(empty("正在匹配", "读取最近缺陷并按规则匹配（不创建运行）"));
+    rpc("policies.test", { policy: policyLike }).then(function (result) {
+      dialog.body.textContent = "";
+      dialog.body.append(node("div", "dyx-note", "最近 " + result.total + " 条缺陷，命中 " + result.matched + " 条。命中缺陷将按「" + (POLICY_MODE_META[policyLike.mode] || {}).label + "」处理。"));
+      if (!result.items.length) { dialog.body.append(empty("没有可匹配的缺陷", "触发状态下暂无缺陷")); return; }
+      var list = node("div", "dyx-record-list");
+      result.items.forEach(function (item) {
+        var row = node("article", "dyx-record");
+        var head = node("div", "dyx-record-head");
+        head.append(
+          node("span", "dyx-badge " + (item.matched ? "ok" : ""), item.matched ? "命中" : "不命中"),
+          node("strong", "", (item.serialNumber || item.id) + " " + item.subject)
+        );
+        var meta = node("div", "dyx-record-meta");
+        meta.append(node("span", "", item.reason));
+        meta.append(node("span", "", [item.statusName, item.priority, item.assignedToName].filter(Boolean).join(" · ")));
+        row.append(head, meta);
+        list.append(row);
+      });
+      dialog.body.append(list);
+    }).catch(function (error) {
+      dialog.body.textContent = "";
+      dialog.body.append(empty("试运行失败", error.message));
+    });
+    dialog.foot.append(button("关闭", "", dialog.close));
+  }
+
+  function renderRunsPage(section) {
+    var engineStatus = state.engine.status;
+    var head = node("div", "dyx-card");
+    var line = node("div", "dyx-actions");
+    var engineChip = node("span", "dyx-badge " + (engineStatus && engineStatus.available ? "ok" : "fail"),
+      engineStatus ? (engineStatus.available ? "引擎已启用" : "引擎不可用") : "引擎状态未知");
+    engineChip.title = engineStatus && engineStatus.lastScanAt ? "上轮扫描 " + shortDateTime(engineStatus.lastScanAt) : "";
+    line.append(engineChip);
+    if (engineStatus && engineStatus.lastScanError) line.append(node("span", "dyx-muted", "扫描异常：" + engineStatus.lastScanError));
+    var filter = node("select", "dyx-select");
+    filter.setAttribute("aria-label", "按状态筛选运行记录");
+    [["", "全部状态"]].concat(Object.keys(RUN_STATUS_META).map(function (key) { return [key, RUN_STATUS_META[key][0]]; })).forEach(function (item) {
+      var option = node("option", "", item[1]);
+      option.value = item[0];
+      if (item[0] === state.runs.status) option.selected = true;
+      filter.append(option);
+    });
+    filter.addEventListener("change", function () {
+      state.runs.status = filter.value;
+      loadRuns();
+    });
+    line.append(filter);
+    line.append(button("刷新", "", function () { loadRuns(); loadEngineStatus(); }));
+    line.append(button("立即扫描", "primary", function () {
+      setBusy(line, true);
+      rpc("engine.scanNow", {}).then(function (result) {
+        if (result && result.ok) toast("扫描完成" + (result.results && result.results.length ? "：" + result.results.map(function (item) { return item.name + " 命中 " + (item.matched || 0); }).join("，") : "：暂无启用的到期规则"));
+        loadRuns();
+      }).catch(function (error) { toast("扫描失败：" + error.message, true); }).then(function () { setBusy(line, false); });
+    }));
+    head.append(line);
+    section.append(head);
+    if (!state.runs.items.length) {
+      section.append(node("div", "dyx-card", empty("暂无运行记录", "规则命中缺陷后会在这里生成运行台账")));
+      return;
+    }
+    var list = node("div", "dyx-record-list");
+    state.runs.items.forEach(function (run) {
+      var row = node("article", "dyx-record dyx-record-clickable dyx-tile-card" + (run.status === "failed" || run.status === "needs-human" ? " tone-fail" : run.status === "succeeded" ? " tone-ok" : run.status === "awaiting-confirm" ? " tone-run" : ""));
+      row.addEventListener("click", function (event) {
+        if (event.target.closest("button")) return;
+        openRunDetail(run.id);
+      });
+      var headRow = node("div", "dyx-record-head");
+      headRow.append(runBadge(run.status), node("strong", "", (run.serial || run.defectId) + " " + (run.subject || "")));
+      var meta = node("div", "dyx-record-meta");
+      meta.append(node("span", "", "规则：" + (run.policyName || run.policyId)));
+      meta.append(node("span", "", (POLICY_MODE_META[run.mode] || {}).label || run.mode));
+      if (run.result && run.result.outcome) meta.append(node("span", "", "结论：" + (OUTCOME_META[run.result.outcome] || run.result.outcome)));
+      if (run.result && run.result.mrUrl) {
+        var link = node("a", "dyx-link", "MR " + (run.result.mrId || ""));
+        link.href = run.result.mrUrl;
+        link.target = "_blank";
+        link.rel = "noreferrer";
+        meta.append(link);
+      }
+      var foot = node("div", "dyx-record-foot");
+      foot.append(node("span", "dyx-muted", shortDateTime(run.startedAt) + (run.durationMs ? " · " + Math.round(run.durationMs / 1000) + " 秒" : "")));
+      var actions = node("div", "dyx-actions");
+      actions.append(button("详情", "", function () { openRunDetail(run.id); }));
+      if (run.status === "awaiting-confirm") {
+        actions.append(button("批准", "primary", function () { confirmRun(run, "approve"); }));
+      }
+      foot.append(actions);
+      row.append(headRow, meta, foot);
+      list.append(row);
+    });
+    section.append(list);
+  }
+
+  function confirmRun(run, decision) {
+    var labels = { approve: "批准并继续实施", handoff: "转人工", reject: "忽略" };
+    if (decision !== "approve" && !window.confirm("确认对缺陷 " + (run.serial || run.defectId) + " 执行「" + labels[decision] + "」？")) return;
+    rpc("runs.confirm", { runId: run.id, decision: decision }).then(function (result) {
+      toast(decision === "approve" ? "已批准，智能体继续实施" : decision === "handoff" ? "已转人工" : "已忽略");
+      loadRuns();
+      return result;
+    }).catch(function (error) { toast("操作失败：" + error.message, true); });
+  }
+
+  function openRunDetail(runId) {
+    var dialog = modal("运行详情", true);
+    dialog.body.append(empty("正在读取", runId));
+    rpc("runs.get", { runId: runId }).then(function (run) {
+      dialog.body.textContent = "";
+      var head = node("div", "dyx-record-head");
+      head.append(runBadge(run.status), node("strong", "", (run.serial || run.defectId) + " " + (run.subject || "")));
+      var meta = node("div", "dyx-record-meta");
+      meta.append(node("span", "", "规则：" + (run.policyName || run.policyId)));
+      meta.append(node("span", "", (POLICY_MODE_META[run.mode] || {}).label || run.mode));
+      meta.append(node("span", "", shortDateTime(run.startedAt) + (run.endedAt ? " → " + shortDateTime(run.endedAt) : "") + (run.durationMs ? " · " + Math.round(run.durationMs / 1000) + " 秒" : "")));
+      dialog.body.append(head, meta);
+      if (run.error) dialog.body.append(node("div", "dyx-note", "失败原因：" + run.error));
+
+      var steps = node("div", "dyx-record-list");
+      (run.steps || []).forEach(function (step) {
+        var row = node("article", "dyx-record");
+        var stepHead = node("div", "dyx-record-head");
+        stepHead.append(node("span", "dyx-badge ok", "✓"), node("strong", "", RUN_STATUS_META[step.name] ? RUN_STATUS_META[step.name][0] : step.name));
+        row.append(stepHead);
+        if (step.detail) {
+          var stepMeta = node("div", "dyx-record-meta");
+          stepMeta.append(node("span", "", step.detail));
+          row.append(stepMeta);
+        }
+        if (step.at) {
+          var stepFoot = node("div", "dyx-record-foot");
+          stepFoot.append(node("span", "dyx-muted", shortDateTime(step.at)));
+          row.append(stepFoot);
+        }
+        steps.append(row);
+      });
+      if ((run.steps || []).length) dialog.body.append(node("h4", "", "步骤"), steps);
+
+      var result = run.result || {};
+      if (result.summary || result.rootCause || result.plan) {
+        var card = node("div", "dyx-card");
+        if (result.outcome) card.append(node("p", "", "结论：" + (OUTCOME_META[result.outcome] || result.outcome)));
+        if (result.summary) card.append(node("p", "", "摘要：" + result.summary));
+        if (result.rootCause) card.append(node("p", "", "根因：" + result.rootCause));
+        if (result.plan) card.append(node("p", "", "方案：" + result.plan));
+        if (result.risk) card.append(node("p", "", "风险：" + result.risk));
+        if (result.branch) card.append(node("p", "", "分支：" + result.branch));
+        if ((result.commits || []).length) card.append(node("p", "", "提交：" + result.commits.join(" ")));
+        if ((result.changedFiles || []).length) {
+          var files = node("ul", "");
+          result.changedFiles.forEach(function (file) { files.append(node("li", "", file)); });
+          card.append(node("p", "", "改动文件（" + result.changedFiles.length + "）："), files);
+        }
+        (result.verify || []).forEach(function (item) {
+          card.append(node("p", "", (item.ok ? "✅" : "❌") + " " + item.command));
+        });
+        if (result.mrUrl) {
+          var mrLink = node("a", "dyx-link", result.mrUrl);
+          mrLink.href = result.mrUrl;
+          mrLink.target = "_blank";
+          mrLink.rel = "noreferrer";
+          card.append(node("p", "", "合并请求："), mrLink);
+        }
+        dialog.body.append(node("h4", "", "结果"), card);
+      }
+      if ((run.log || []).length) {
+        var logList = node("div", "dyx-record-list");
+        run.log.slice(-30).forEach(function (entry) {
+          var row = node("article", "dyx-record");
+          var logMeta = node("div", "dyx-record-meta");
+          logMeta.append(node("span", "", (entry.t ? entry.t + " " : "") + (entry.m || "")));
+          row.append(logMeta);
+          logList.append(row);
+        });
+        dialog.body.append(node("h4", "", "日志（最近 " + Math.min(30, run.log.length) + " 条）"), logList);
+      }
+
+      dialog.foot.textContent = "";
+      if (run.sessionId) {
+        dialog.foot.append(button("打开会话", "", function () { openRunSession(run); }));
+      }
+      if (run.status === "awaiting-confirm") {
+        dialog.foot.append(button("✓ 批准并修复", "primary", function () { confirmRun(run, "approve"); }));
+        dialog.foot.append(button("✍ 转人工", "", function () { confirmRun(run, "handoff"); }));
+        dialog.foot.append(button("✕ 忽略", "danger", function () { confirmRun(run, "reject"); }));
+      }
+      if (["queued", "fetching", "classifying", "agent-running", "submitting", "writeback"].indexOf(run.status) >= 0) {
+        dialog.foot.append(button("取消", "danger", function () {
+          rpc("runs.cancel", { runId: run.id }).then(function () { toast("已请求取消"); loadRuns(); }).catch(function (error) { toast("取消失败：" + error.message, true); });
+        }));
+      }
+      if (["needs-human", "failed", "canceled", "interrupted"].indexOf(run.status) >= 0) {
+        dialog.foot.append(button("重试", "", function () {
+          rpc("runs.retry", { runId: run.id }).then(function () { toast("已重新入队"); dialog.close(); loadRuns(); }).catch(function (error) { toast("重试失败：" + error.message, true); });
+        }));
+      }
+      dialog.foot.append(button("关闭", "", dialog.close));
+    }).catch(function (error) {
+      dialog.body.textContent = "";
+      dialog.body.append(empty("读取失败", error.message));
+      dialog.foot.textContent = "";
+      dialog.foot.append(button("关闭", "", dialog.close));
+    });
+  }
+
+  // 运行详情 → 打开该次运行的智能体会话（会话留在工作区内，可继续人工接手）。
+  function openRunSession(run) {
+    var sessions = services && services.sessions;
+    if (!sessions) { toast("会话服务尚未就绪，请重启页面后重试", true); return; }
+    var open = function () {
+      try {
+        sessions.open(run.sessionId);
+        toast("已打开运行会话");
+      } catch (error) {
+        toast("打开会话失败：" + (error instanceof Error ? error.message : String(error)), true);
+      }
+    };
+    if (run.workspaceId && services.workspaces) {
+      ensureWorkspaceVisible(run.workspaceId).then(open, function (error) {
+        toast(error instanceof Error ? error.message : String(error), true);
+      });
+    } else {
+      open();
+    }
+  }
+
+  function renderInboxPage(section) {
+    var inbox = state.runs.items.filter(function (run) { return run.status === "awaiting-confirm"; });
+    var actions = node("div", "dyx-actions");
+    actions.append(button("刷新", "", function () { loadRuns(); }));
+    section.append(actions);
+    if (!inbox.length) {
+      section.append(node("div", "dyx-card", empty("没有待确认的分析", "「先析后确认」规则的分析结论会出现在这里，裁决后智能体才会实施修复")));
+      return;
+    }
+    var list = node("div", "dyx-record-list");
+    inbox.forEach(function (run) {
+      var card = node("article", "dyx-record dyx-tile-card tone-run");
+      var head = node("div", "dyx-record-head");
+      head.append(runBadge(run.status), node("strong", "", (run.serial || run.defectId) + " " + (run.subject || "")));
+      var meta = node("div", "dyx-record-meta");
+      meta.append(node("span", "", "规则：" + (run.policyName || run.policyId)));
+      var result = run.result || {};
+      if (result.rootCause) meta.append(node("span", "", "根因：" + result.rootCause));
+      if (result.plan) meta.append(node("span", "", "方案：" + result.plan));
+      if (result.risk) meta.append(node("span", "", "风险：" + result.risk));
+      if ((result.changedFiles || []).length) meta.append(node("span", "", "涉及：" + result.changedFiles.slice(0, 6).join("、") + (result.changedFiles.length > 6 ? " 等" : "")));
+      var foot = node("div", "dyx-record-foot");
+      foot.append(node("span", "dyx-muted", shortDateTime(run.startedAt)));
+      var actions2 = node("div", "dyx-actions");
+      if (run.sessionId) actions2.append(button("打开会话", "", function () { openRunSession(run); }));
+      actions2.append(button("✓ 批准并修复", "primary", function () { confirmRun(run, "approve"); }));
+      actions2.append(button("✍ 转人工", "", function () { confirmRun(run, "handoff"); }));
+      actions2.append(button("✕ 忽略", "danger", function () { confirmRun(run, "reject"); }));
+      foot.append(actions2);
+      card.append(head, meta, foot);
+      list.append(card);
+    });
+    section.append(list);
+  }
+
+  // 旧画布只读：仅展示历史流程定义；执行已全部收编到规则引擎。
+  function renderLegacyCanvasPage(section) {
+    var flow = activeFlow();
+    var actions = node("div", "dyx-actions");
+    var selector = node("select", "dyx-select");
+    selector.setAttribute("aria-label", "选择旧编排");
+    if (!state.flows.items.length) selector.append(node("option", "", "暂无旧编排"));
+    state.flows.items.forEach(function (item, index) {
+      var option = node("option", "", item.name);
+      option.value = String(index);
+      if (index === state.flows.active) option.selected = true;
+      selector.append(option);
+    });
+    selector.addEventListener("change", function () {
+      state.flows.active = Number(selector.value) || 0;
+      render();
+    });
+    actions.append(selector, node("span", "dyx-muted", "只读展示；这些流程的执行已由规则引擎接管，可在 Phase 2 归档删除。"));
+    section.append(actions);
+    if (!flow) {
+      section.append(node("div", "dyx-card", empty("没有旧版画布编排", "")));
       return;
     }
     section.append(renderFlowShell(flow));
-    main.append(section);
-    bindFlowCanvas();
-    drawFlowEdges();
-    renderFlowStates();
   }
 
   function flowNodeEl(node, selected) {
@@ -2958,36 +3553,16 @@ function createWorkspace(onRequestClose, notifier, services) {
 
   function renderFlowShell(flow) {
     var shell = node("div", "dyx-flow-shell");
-    var palette = node("div", "dyx-flow-palette");
-    var groups = [];
-    Object.keys(FLOW_NODE_TYPES).forEach(function (key) {
-      var type = FLOW_NODE_TYPES[key];
-      if (groups.indexOf(type.group) < 0) groups.push(type.group);
-    });
-    groups.forEach(function (group) {
-      palette.append(node("h4", "", group));
-      Object.keys(FLOW_NODE_TYPES).forEach(function (key) {
-        var type = FLOW_NODE_TYPES[key];
-        if (type.group !== group) return;
-        var item = node2("button", "dyx-flow-pi");
-        item.type = "button";
-        item.title = "点击加入画布";
-        var glyph = node2("span", "dyx-flow-glyph", type.glyph);
-        glyph.style.background = type.color;
-        item.append(glyph, node2("span", "", type.name));
-        item.addEventListener("click", function () { addFlowNode(key); });
-        palette.append(item);
-      });
-    });
+    shell.append(node("div", "dyx-note dyx-flow-readonly-note", "旧版画布（只读）：仅展示历史流程定义，节点与连线不可编辑；执行已由规则引擎接管。"));
     var canvas = node2("div", "dyx-flow-canvas");
-    canvas.setAttribute("aria-label", "编排画布：拖拽节点调整位置，从右侧圆点拖到目标左侧圆点连线");
+    canvas.setAttribute("aria-label", "旧版编排画布（只读）");
     var stage = node2("div", "dyx-flow-stage");
     var svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
     svg.setAttribute("class", "dyx-flow-edges");
     stage.append(svg);
-    flow.nodes.forEach(function (node) { stage.append(flowNodeEl(node, node.id === state.flows.sel)); });
+    flow.nodes.forEach(function (item) { stage.append(flowNodeEl(item, false)); });
     canvas.append(stage);
-    shell.append(palette, canvas);
+    shell.append(canvas);
     return shell;
   }
 
@@ -3014,24 +3589,19 @@ function createWorkspace(onRequestClose, notifier, services) {
     return "M" + a.x + "," + a.y + " C" + cx1 + "," + cy1 + " " + cx2 + "," + cy2 + " " + b.x + "," + b.y;
   }
 
-  function drawFlowEdges(ghost) {
+  function drawFlowEdges() {
     var svg = flowSvg();
     var flow = activeFlow();
     if (!svg || !flow) return;
     var stage = flowStage();
     svg.setAttribute("width", Math.max(640, stage ? stage.offsetWidth : 640));
     svg.setAttribute("height", Math.max(600, stage ? stage.offsetHeight : 600));
-    var run = state.flows.run && state.flows.run.flowId === flow.id ? state.flows.run : null;
     var parts = [];
-    flow.edges.forEach(function (edge, index) {
+    flow.edges.forEach(function (edge) {
       var from = flow.nodes.find(function (node) { return node.id === edge.f; });
       var to = flow.nodes.find(function (node) { return node.id === edge.t; });
       if (!from || !to) return;
-      var path = flowEdgePath(flowPorts(from, "out"), flowPorts(to, "in"));
-      var cls = "";
-      if (state.flows.selEdge === index) cls = "danger";
-      else if (run && run.nodes[edge.f] === "成功") cls = "ok";
-      parts.push({ path: path, cls: cls, label: edge.label || "", mid: flowPorts(from, "out"), end: flowPorts(to, "in"), index: index });
+      parts.push({ path: flowEdgePath(flowPorts(from, "out"), flowPorts(to, "in")), label: edge.label || "", mid: flowPorts(from, "out"), end: flowPorts(to, "in") });
     });
     svg.textContent = "";
     parts.forEach(function (item) {
@@ -3039,24 +3609,6 @@ function createWorkspace(onRequestClose, notifier, services) {
       base.setAttribute("d", item.path);
       if (item.cls) base.setAttribute("class", item.cls);
       svg.append(base);
-      var hit = document.createElementNS("http://www.w3.org/2000/svg", "path");
-      hit.setAttribute("d", item.path);
-      hit.setAttribute("class", "dyx-flow-edge-hit");
-      hit.style.cssText = "fill:none;stroke:transparent;stroke-width:12;pointer-events:stroke;cursor:pointer";
-      hit.addEventListener("click", function () {
-        if (state.flows.selEdge === item.index) {
-          flow.edges.splice(item.index, 1);
-          state.flows.selEdge = -1;
-          saveFlowSoon();
-          drawFlowEdges();
-          toast("连线已删除");
-        } else {
-          state.flows.selEdge = item.index;
-          drawFlowEdges();
-          toast("再次点击该连线即可删除");
-        }
-      });
-      svg.append(hit);
       if (item.label) {
         var label = document.createElementNS("http://www.w3.org/2000/svg", "text");
         label.setAttribute("class", "dyx-flow-elabel");
@@ -3067,698 +3619,10 @@ function createWorkspace(onRequestClose, notifier, services) {
         svg.append(label);
       }
     });
-    if (ghost && ghost.from) {
-      var ghostFrom = flow.nodes.find(function (node) { return node.id === ghost.from; });
-      if (ghostFrom) {
-        var ghostPath = document.createElementNS("http://www.w3.org/2000/svg", "path");
-        ghostPath.setAttribute("d", flowEdgePath(flowPorts(ghostFrom, "out"), ghost.to));
-        ghostPath.setAttribute("stroke-dasharray", "5 4");
-        ghostPath.style.cssText = "fill:none;stroke:var(--dyx-brand);stroke-width:1.6";
-        svg.append(ghostPath);
-      }
-    }
   }
 
   function renderFlowStates() {
-    var flow = activeFlow();
-    if (!flow) return;
-    var run = state.flows.run && state.flows.run.flowId === flow.id ? state.flows.run : null;
-    var stage = flowStage();
-    if (!stage) return;
-    stage.querySelectorAll(".dyx-flow-node").forEach(function (element) {
-      var node = flow.nodes.find(function (item) { return item.id === element.dataset.nid; });
-      if (!node) return;
-      var status = run ? run.nodes[node.id] : "";
-      element.classList.remove("run", "ok", "fail", "wait", "skip");
-      var tone = { "执行中": "run", "成功": "ok", "失败": "fail", "等待确认": "wait", "已跳过": "skip" }[status] || "";
-      if (tone) element.classList.add(tone);
-      var badge = element.querySelector(".dyx-flow-node-state");
-      if (badge) badge.textContent = status === "执行中" ? "…" : status === "成功" ? "✓" : status === "失败" ? "✕" : status === "等待确认" ? "⏸" : status === "已跳过" ? "跳过" : "";
-      var oldActions = element.querySelector(".dyx-flow-node-actions");
-      if (oldActions) oldActions.remove();
-      if (status === "等待确认") {
-        var actions = node2("div", "dyx-flow-node-actions");
-        actions.append(
-          button("✓ 通过", "dyx-btn-sm primary", function (event) {
-            event.stopPropagation();
-            continueFlowCheckpoint(node.id, true);
-          }),
-          button("✕ 终止", "dyx-btn-sm danger", function (event) {
-            event.stopPropagation();
-            continueFlowCheckpoint(node.id, false);
-          })
-        );
-        element.append(actions);
-      }
-    });
-  }
-
-  function bindFlowCanvas() {
-    var canvas = main.querySelector(".dyx-flow-canvas");
-    var stage = flowStage();
-    if (!canvas || !stage) return;
-    var drag = null;
-    stage.addEventListener("pointerdown", function (event) {
-      var port = event.target.closest(".dyx-flow-port");
-      var flow = activeFlow();
-      if (!flow) return;
-      if (port && port.dataset.side === "out") {
-        state.flows.connectFrom = port.dataset.nid;
-        event.preventDefault();
-        return;
-      }
-      if (port && port.dataset.side === "in" && state.flows.connectFrom) {
-        finishFlowConnect(port.dataset.nid);
-        return;
-      }
-      var nodeElement = event.target.closest(".dyx-flow-node");
-      if (!nodeElement) return;
-      var node = flow.nodes.find(function (item) { return item.id === nodeElement.dataset.nid; });
-      if (!node) return;
-      drag = { node: node, element: nodeElement, startX: event.clientX, startY: event.clientY, originX: node.x, originY: node.y, moved: false };
-      event.preventDefault();
-    });
-    canvas.addEventListener("pointermove", function (event) {
-      var flow = activeFlow();
-      if (!flow) return;
-      if (state.flows.connectFrom) {
-        var rect = stage.getBoundingClientRect();
-        drawFlowEdges({ from: state.flows.connectFrom, to: { x: event.clientX - rect.left, y: event.clientY - rect.top } });
-        return;
-      }
-      if (!drag) return;
-      var dx = event.clientX - drag.startX;
-      var dy = event.clientY - drag.startY;
-      if (Math.abs(dx) > 3 || Math.abs(dy) > 3) drag.moved = true;
-      if (!drag.moved) return;
-      drag.node.x = Math.max(0, drag.originX + dx);
-      drag.node.y = Math.max(0, drag.originY + dy);
-      drag.element.style.left = drag.node.x + "px";
-      drag.element.style.top = drag.node.y + "px";
-      drawFlowEdges();
-    });
-    canvas.addEventListener("pointerup", function (event) {
-      var flow = activeFlow();
-      if (flow && state.flows.connectFrom) {
-        var target = event.target.closest("[data-nid]");
-        if (target && target.dataset.nid !== state.flows.connectFrom) finishFlowConnect(target.dataset.nid);
-        else if (!event.target.closest(".dyx-flow-port")) {
-          state.flows.connectFrom = "";
-          drawFlowEdges();
-        }
-      }
-      if (drag) {
-        if (!drag.moved) {
-          state.flows.sel = drag.node.id;
-          state.flows.selEdge = -1;
-          stage.querySelectorAll(".dyx-flow-node").forEach(function (element) {
-            element.classList.toggle("selected", element.dataset.nid === drag.node.id);
-          });
-          openFlowNodeConfig(drag.node);
-        } else {
-          saveFlowSoon();
-        }
-        drag = null;
-      }
-    });
-  }
-
-  function finishFlowConnect(toId) {
-    var flow = activeFlow();
-    if (!flow) return;
-    var exists = flow.edges.some(function (edge) { return edge.f === state.flows.connectFrom && edge.t === toId; });
-    if (!exists) {
-      flow.edges.push({ f: state.flows.connectFrom, t: toId, label: "" });
-      saveFlowSoon();
-      toast("已连线");
-    }
-    state.flows.connectFrom = "";
-    drawFlowEdges();
-  }
-
-  function addFlowNode(typeKey) {
-    var flow = activeFlow();
-    if (!flow) return;
-    var type = FLOW_NODE_TYPES[typeKey];
-    if (!type) return;
-    if (flow.nodes.length >= 64) return toast("节点数量已达上限", true);
-    var suffix = flow.nodes.filter(function (item) { return item.tp === typeKey; }).length;
-    var node = clampFlowNode({
-      id: "n" + Date.now().toString(36) + Math.random().toString(36).slice(2, 5),
-      tp: typeKey,
-      name: type.name + (suffix ? " " + (suffix + 1) : ""),
-      x: 60 + (flow.nodes.length % 3) * 196,
-      y: 470 + Math.floor(flow.nodes.length / 3) * 130,
-      cfg: {}
-    });
-    (type.fields || []).forEach(function (field2) {
-      if (field2.o && field2.o.length) node.cfg[field2.k] = field2.o[0];
-    });
-    flow.nodes.push(node);
-    state.flows.sel = node.id;
-    saveFlowSoon();
-    render();
-    toast("已加入「" + type.name + "」，可拖拽调整位置");
-  }
-
-  function openFlowNodeConfig(flowNode) {
-    var flow = activeFlow();
-    if (!flow) return;
-    var type = FLOW_NODE_TYPES[flowNode.tp];
-    var dialog = modal("节点：" + type.name);
-    var form = node2("div", "dyx-form");
-    var nameInput = input("text", "节点名称", flowNode.name);
-    form.append(field("节点名称", nameInput));
-    (type.fields || []).forEach(function (field2) {
-      if (field2.o && field2.o.length) {
-        var select = node2("select", "dyx-select");
-        field2.o.forEach(function (option) { var entry = node2("option", "", option); entry.value = option; select.append(entry); });
-        if (field2.k === "pipe") {
-          if (!state.pipelines.items.length) {
-            rpc("pipelines.list", rpcArgs({ page: 1, pageSize: 30 })).then(function (result) {
-              state.pipelines.items = result.items || [];
-              fillPipeOptions(select);
-            }).catch(function () {});
-          }
-          fillPipeOptions(select);
-        } else if (field2.k === "plan") {
-          if (!state.tests.plans.length) {
-            rpc("tests.plans.list", rpcArgs({ page: 1, pageSize: 30 })).then(function (result) {
-              state.tests.plans = result.items || [];
-              fillPlanOptions(select);
-            }).catch(function () {});
-          }
-          fillPlanOptions(select);
-        } else if (field2.k === "st") {
-          if (!state.defectStatusOptions.length) {
-            rpc("defect.statusOptions", rpcArgs({})).then(function (result) {
-              state.defectStatusOptions = result.items || [];
-              fillStatusOptions(select);
-            }).catch(function () {});
-          }
-          fillStatusOptions(select);
-        }
-        select.value = flowNode.cfg[field2.k] || "";
-        select.addEventListener("change", function () {
-          flowNode.cfg[field2.k] = select.value;
-          saveFlowSoon();
-          refreshNodeText(flowNode);
-        });
-        form.append(field(field2.l, select));
-      } else {
-        var control = input("text", field2.l, flowNode.cfg[field2.k] || "");
-        control.addEventListener("change", function () {
-          flowNode.cfg[field2.k] = control.value;
-          saveFlowSoon();
-          refreshNodeText(flowNode);
-        });
-        form.append(field(field2.l + "（可手动输入）", control));
-      }
-    });
-    var runStatus = state.flows.run && state.flows.run.flowId === flow.id ? state.flows.run.nodes[flowNode.id] : "";
-    if (runStatus === "等待确认") {
-      form.append(node2("div", "dyx-note", "该检查点正在等待人工确认。"));
-    }
-    dialog.body.append(form);
-    function fillPipeOptions(select) {
-      var wanted = flowNode.cfg.pipe || "";
-      select.textContent = "";
-      var placeholder = node2("option", "", wanted || "选择流水线");
-      placeholder.value = wanted;
-      select.append(placeholder);
-      state.pipelines.items.forEach(function (item) {
-        var option = node2("option", "", item.name);
-        option.value = item.name;
-        select.append(option);
-      });
-      select.value = wanted;
-    }
-    function fillPlanOptions(select) {
-      var wanted = flowNode.cfg.plan || "";
-      select.textContent = "";
-      var placeholder = node2("option", "", wanted || "选择测试计划");
-      placeholder.value = wanted;
-      select.append(placeholder);
-      state.tests.plans.forEach(function (item) {
-        var option = node2("option", "", item.name);
-        option.value = item.name;
-        select.append(option);
-      });
-      select.value = wanted;
-    }
-    function fillStatusOptions(select) {
-      var wanted = flowNode.cfg.st || "";
-      select.textContent = "";
-      var placeholder = node2("option", "", wanted || "选择状态");
-      placeholder.value = wanted;
-      select.append(placeholder);
-      var byName = new Map();
-      state.defectStatusOptions.forEach(function (item) { if (!byName.has(item.name)) byName.set(item.name, item.name); });
-      byName.forEach(function (name) {
-        var option = node2("option", "", name);
-        option.value = name;
-        select.append(option);
-      });
-      select.value = wanted;
-    }
-    function refreshNodeText(target) {
-      var element = main.querySelector('.dyx-flow-node[data-nid="' + target.id + '"]');
-      if (!element) return;
-      var sub = element.querySelector(".dyx-flow-node-text span");
-      if (sub) sub.textContent = flowNodeSub(target);
-      var title = element.querySelector(".dyx-flow-node-text b");
-      if (title) title.textContent = target.name;
-    }
-    nameInput.addEventListener("change", function () {
-      flowNode.name = nameInput.value.trim() || type.name;
-      saveFlowSoon();
-      refreshNodeText(flowNode);
-    });
-    if (runStatus === "等待确认") {
-      dialog.foot.append(
-        button("✕ 终止", "danger", function () { dialog.close(); continueFlowCheckpoint(flowNode.id, false); }),
-        button("✓ 通过并继续", "primary", function () { dialog.close(); continueFlowCheckpoint(flowNode.id, true); })
-      );
-    } else {
-      dialog.foot.append(
-        button("删除节点", "danger", function () {
-          flow.nodes = flow.nodes.filter(function (item) { return item.id !== flowNode.id; });
-          flow.edges = flow.edges.filter(function (edge) { return edge.f !== flowNode.id && edge.t !== flowNode.id; });
-          state.flows.sel = "";
-          saveFlowSoon();
-          dialog.close();
-          render();
-        }),
-        button("完成", "primary", dialog.close)
-      );
-    }
-  }
-
-  function openFlowRuns(flow) {
-    var dialog = modal("运行记录：" + flow.name);
-    if (!flow.runs.length) dialog.body.append(empty("还没有运行记录", "点击画布右上角“运行”开始第一次执行。"));
-    else {
-      var list = node("div", "dyx-record-list");
-      flow.runs.forEach(function (run) {
-        var row = node("article", "dyx-record");
-        var head = node("div", "dyx-record-head");
-        head.append(
-          node("span", "dyx-badge " + (run.status === "成功" ? "ok" : run.status === "失败" ? "fail" : "run"), run.status),
-          node("span", "dyx-muted", shortDateTime(run.startedAt) + " · " + (run.durationMs ? Math.round(run.durationMs / 1000) + " 秒" : ""))
-        );
-        var meta = node("div", "dyx-record-meta");
-        meta.append(node("span", "", "触发：" + (run.trg || "手动")));
-        (run.log || []).slice(-3).forEach(function (entry) {
-          if (entry.m) meta.append(node("span", "", entry.m));
-        });
-        row.append(head, meta);
-        list.append(row);
-      });
-      dialog.body.append(list);
-    }
-    dialog.foot.append(button("关闭", "", dialog.close));
-  }
-
-  function incomingFlowEdges(flow, nodeId) {
-    return flow.edges.filter(function (edge) { return edge.t === nodeId; });
-  }
-
-  function flowDownstream(flow, nodeId) {
-    var result = [];
-    var stack = [nodeId];
-    while (stack.length) {
-      var current = stack.pop();
-      flow.edges.forEach(function (edge) {
-        if (edge.f === current && result.indexOf(edge.t) < 0) {
-          result.push(edge.t);
-          stack.push(edge.t);
-        }
-      });
-    }
-    return result;
-  }
-
-  function startFlowRun(flow, defectContext) {
-    if (state.flows.run && state.flows.run.active) return toast("已有编排正在运行，请等待完成", true);
-    if (!flow.nodes.length) return toast("画布是空的，先添加节点", true);
-    var now = Date.now();
-    var nodes = {};
-    flow.nodes.forEach(function (node) { nodes[node.id] = "待执行"; });
-    state.flows.run = {
-      flowId: flow.id,
-      id: "r" + now.toString(36) + Math.random().toString(36).slice(2, 5),
-      active: true,
-      status: "进行中",
-      trg: defectContext && defectContext.serialNumber ? "缺陷 " + defectContext.serialNumber : "手动",
-      startedAt: new Date(now).toISOString(),
-      durationMs: 0,
-      nodes: nodes,
-      log: [],
-      startMs: now
-    };
-    state.flows.runCtx = defectContext ? { defectId: defectContext.defectId, detail: null } : { defectId: "", detail: null };
-    flowLog("▶ 触发编排：" + flow.name + "（" + state.flows.run.trg + "）", "warn");
-    persistFlowRun(flow, true);
-    renderFlowStates();
-    drawFlowEdges();
-    stepFlowRun();
-  }
-
-  function flowLog(message, kind) {
-    var run = state.flows.run;
-    if (!run) return;
-    var elapsed = Math.max(0, Math.round((Date.now() - run.startMs) / 1000));
-    run.log.push({ t: elapsed + "s", m: String(message).slice(0, 500), c: kind || "" });
-    if (run.log.length > 400) run.log.splice(0, run.log.length - 400);
-  }
-
-  var persistRunTimer = null;
-  function persistFlowRun(flow, immediate) {
-    if (!state.flows.run || state.flows.run.flowId !== flow.id) return;
-    if (persistRunTimer) clearTimeout(persistRunTimer);
-    var submit = function () {
-      var run = state.flows.run;
-      if (!run || run.flowId !== flow.id) return;
-      run.durationMs = run.startMs ? Date.now() - run.startMs : 0;
-      rpc("flows.run.save", { flowId: flow.id, run: {
-        id: run.id,
-        status: run.status,
-        trg: run.trg,
-        startedAt: run.startedAt,
-        endedAt: run.status === "成功" || run.status === "失败" ? new Date().toISOString() : "",
-        durationMs: run.durationMs,
-        nodes: run.nodes,
-        log: run.log
-      } }).catch(function () {});
-    };
-    if (immediate) submit();
-    else persistRunTimer = setTimeout(submit, 700);
-  }
-
-  function stepFlowRun() {
-    var run = state.flows.run;
-    var flow = activeFlow();
-    if (!run || !run.active || !flow || run.flowId !== flow.id) return;
-    var ready = flow.nodes.filter(function (node) {
-      return run.nodes[node.id] === "待执行" && incomingFlowEdges(flow, node.id).every(function (edge) { return run.nodes[edge.f] === "成功"; });
-    });
-    if (!ready.length) {
-      var running = flow.nodes.some(function (node) { return run.nodes[node.id] === "执行中"; });
-      if (!running) finishFlowRun();
-      return;
-    }
-    ready.forEach(function (node) {
-      run.nodes[node.id] = "执行中";
-      flowLog("· " + node.name + "：执行中…");
-      executeFlowNode(node);
-    });
-    renderFlowStates();
-    drawFlowEdges();
-    persistFlowRun(flow, false);
-  }
-
-  function flowConditionPasses(node, done) {
-    var cfg = node.cfg || {};
-    if (cfg.f === "根因定位") { done(true); return; }
-    var wanted = cfg.op === "=" ? cfg.v : null;
-    var ceiling = cfg.op === "≤" ? cfg.v : null;
-    var ranks = { P0: 0, P1: 1, P2: 2, P3: 3 };
-    ensureFlowDefect(function (detail) {
-      var priority = String((detail && detail.defect && (detail.defect.priority || detail.defect.severity)) || "").toUpperCase();
-      var rank = ranks[(priority.match(/P[0-3]/) || [""])[0]];
-      if (ceiling !== null) {
-        done(rank !== undefined ? rank <= (ranks[ceiling] === undefined ? 1 : ranks[ceiling]) : true);
-        return;
-      }
-      if (wanted !== null) { done(priority === wanted); return; }
-      done(true);
-    });
-  }
-
-  // 懒加载当前触发缺陷详情；无缺陷上下文时回调 null。
-  function ensureFlowDefect(done) {
-    var ctx = state.flows.runCtx || (state.flows.runCtx = { defectId: "", detail: null });
-    if (!ctx.defectId) { done(null); return; }
-    if (ctx.detail) { done(ctx.detail); return; }
-    rpc("defect.get", rpcArgs({ defectId: ctx.defectId })).then(function (detail) {
-      ctx.detail = detail;
-      done(detail);
-    }).catch(function (error) {
-      flowLog("✕ 缺陷详情读取失败：" + error.message, "error");
-      done(null);
-    });
-  }
-
-  function executeFlowNode(node) {
-    var run = state.flows.run;
-    var flow = activeFlow();
-    var finish = function (status, message, kind) {
-      run.nodes[node.id] = status;
-      if (message) flowLog((status === "成功" ? "✓ " : status === "失败" ? "✕ " : "— ") + node.name + "：" + message, kind || (status === "失败" ? "error" : ""));
-      renderFlowStates();
-      drawFlowEdges();
-      if (status === "成功" || status === "失败" || status === "已跳过") {
-        if (status === "成功" && node.tp === "op-cond") applyFlowConditionBranches(node);
-        if (status === "失败") skipFlowDownstream(flow, node.id);
-        stepFlowRun();
-      } else {
-        persistFlowRun(flow, false);
-      }
-    };
-    var type = FLOW_NODE_TYPES[node.tp];
-    var action;
-    try {
-      action = runFlowNodeAction(node, type);
-    } catch (error) {
-      action = Promise.reject(error);
-    }
-    action.then(function (result) {
-      if (result && result.checkpoint) {
-        run.status = "等待确认";
-        finish("等待确认", result.message || "等待人工确认", "warn");
-        return;
-      }
-      run.status = "进行中";
-      finish("成功", result && result.message || "完成");
-    }).catch(function (error) {
-      finish("失败", error instanceof Error ? error.message : String(error));
-    });
-  }
-
-  function applyFlowConditionBranches(node) {
-    var flow = activeFlow();
-    var run = state.flows.run;
-    var cfg = node.cfg || {};
-    flow.edges.filter(function (edge) { return edge.f === node.id; }).forEach(function (edge) {
-      var pass = edge.label === "否" ? flowConditionResult === false : flowConditionResult !== false;
-      if (!pass) {
-        var target = flow.nodes.find(function (item) { return item.id === edge.t; });
-        if (target && run.nodes[target.id] === "待执行") {
-          run.nodes[target.id] = "已跳过";
-          flowLog("— 条件" + (edge.label === "否" ? "成立，跳过" : "不成立，跳过") + "：" + target.name);
-          flowDownstream(flow, target.id).forEach(function (downId) {
-            var down = flow.nodes.find(function (item) { return item.id === downId; });
-            if (down && run.nodes[down.id] === "待执行") run.nodes[down.id] = "已跳过";
-          });
-        }
-      }
-    });
-    renderFlowStates();
-  }
-
-  var flowConditionResult = true;
-
-  function runFlowNodeAction(node, type) {
-    var cfg = node.cfg || {};
-    if (node.tp === "op-cond") {
-      return new Promise(function (resolve) {
-        flowConditionPasses(node, function (passes) {
-          flowConditionResult = passes;
-          resolve({ message: "条件" + (passes ? "成立" : "不成立") });
-        });
-      });
-    }
-    if (node.tp === "op-delay") {
-      var minutes = String(cfg.d || "1 分钟");
-      return new Promise(function (resolve) {
-        flowLog("⏳ 延时等待（演示环境按 2 秒执行）");
-        setTimeout(function () { resolve({ message: "已等待 " + minutes }); }, 2000);
-      });
-    }
-    if (node.tp === "ntf-msg") {
-      return ensureFlowDefect(function (detail) {
-        var serial = detail && detail.defect ? detail.defect.serialNumber : "";
-        var body = String(cfg.tpl || "验收提醒") + (serial ? "：" + serial + " " + (detail.defect.subject || "") : "：请关注工作台更新");
-        return rpc("system.notification.show", { title: "云效编排提醒", body: body, tag: "dyx-flow-" + Date.now() }).then(function (result) {
-          return { message: result && result.accepted ? "系统通知已提交" : "当前环境不支持系统通知" };
-        });
-      });
-    }
-    if (node.tp === "ntf-comment") {
-      return new Promise(function (resolve, reject) {
-        ensureFlowDefect(function (detail) {
-          var defect = detail && detail.defect;
-          if (!defect) { reject(new Error("该节点需要缺陷上下文（请从待处理缺陷触发或先接一个触发器）")); return; }
-          var content = "【编排】" + String(cfg.tpl || "处理摘要") + "：自动流程已执行到该节点。";
-          rpc("defect.comment.create", rpcArgs({ defectId: defect.id, content: content })).then(function () {
-            resolve({ message: "评论已回写到 " + defect.serialNumber });
-          }).catch(reject);
-        });
-      });
-    }
-    if (node.tp === "act-item") {
-      return new Promise(function (resolve, reject) {
-        ensureFlowDefect(function (detail) {
-          var defect = detail && detail.defect;
-          if (!defect) { reject(new Error("该节点需要缺陷上下文")); return; }
-          var wanted = String(cfg.st || "已修复");
-          rpc("defect.statuses", rpcArgs({ defectId: defect.id })).then(function (statuses) {
-            var status = (statuses || []).find(function (item) { return item.name === wanted; });
-            if (!status) throw new Error("该缺陷的工作流中没有\"" + wanted + "\"状态，请在节点配置里调整目标状态");
-            var task = rpc("defect.status.update", rpcArgs({ defectId: defect.id, statusId: status.id }));
-            var comment = cfg.cmt === "开"
-              ? rpc("defect.comment.create", rpcArgs({ defectId: defect.id, content: "【编排】状态已更新为" + wanted + "。" }))
-              : Promise.resolve();
-            return Promise.all([task, comment]);
-          }).then(function (values) {
-            var updated = values[0];
-            var listed = state.defects.items.find(function (entry) { return entry.id === updated.id; });
-            if (listed) Object.assign(listed, updated);
-            resolve({ message: defect.serialNumber + " 状态 → " + wanted });
-          }).catch(reject);
-        });
-      });
-    }
-    if (node.tp === "act-pipe") {
-      var ensurePipelines = state.pipelines.items.length
-        ? Promise.resolve()
-        : rpc("pipelines.list", rpcArgs({ page: 1, pageSize: 30 })).then(function (result) { state.pipelines.items = result.items || []; });
-      return ensurePipelines.then(function () {
-        var wanted = String(cfg.pipe || "");
-        var pipeline = (state.pipelines.items || []).find(function (item) { return item.name === wanted; })
-          || (state.pipelines.items || [])[0];
-        if (!pipeline) throw new Error("未找到可运行的流水线");
-        return rpc("pipeline.run.create", rpcArgs({ pipelineId: pipeline.id, comment: "云效编排自动运行" })).then(function (result) {
-          return { message: "流水线「" + pipeline.name + "」已触发（#" + result.pipelineRunId + "）" };
-        });
-      });
-    }
-    if (node.tp === "act-agent") {
-      return new Promise(function (resolve, reject) {
-        runFlowAgent(node, resolve, reject);
-      });
-    }
-    if (type && type.checkpoint) {
-      return Promise.resolve({ checkpoint: true, message: "人工检查点：" + flowNodeSub(node) + "；确认后在节点上点“✓ 通过”继续" });
-    }
-    return Promise.resolve({ message: "完成" });
-  }
-
-  // DSH 智能处理：与缺陷“草稿/处理”同一通道。带缺陷上下文时携带标题/描述/图片，
-  // 否则发送节点说明文本。生成草稿=填输入框不发送；直接发送=新会话直接 prompt。
-  function runFlowAgent(node, resolve, reject) {
-    var cfg = node.cfg || {};
-    var binding = selectedAccount() && selectedAccount().workspace || null;
-    if (!binding || !binding.id) { reject(new Error("当前项目未绑定 DSH 工作区，请先到设置页绑定")); return; }
-    var conversation = handleConversation();
-    if (!conversation) { reject(new Error("会话服务尚未就绪，请重启页面后重试")); return; }
-    ensureFlowDefect(function (detail) {
-      var prepare = detail
-        ? buildHandlePayload(detail).then(function (payload) {
-            return { text: payload.text, images: payload.images };
-          })
-        : Promise.resolve({ text: "【编排】" + node.name + "：" + flowNodeSub(node), images: [] });
-      prepare.then(function (payload) {
-        return ensureWorkspaceVisible(binding.id).then(function () {
-          if (cfg.mode === "生成草稿") return sendHandleDraft(conversation, binding.id, payload);
-          return sendHandleImmediate(conversation, binding.id, payload);
-        }).then(function () {
-          return { message: "已" + (cfg.mode === "生成草稿" ? "填入工作区草稿" : "发送到工作区新会话") + "（" + (binding.title || binding.id) + "）" };
-        });
-      }).then(resolve, reject);
-    });
-  }
-
-  function skipFlowDownstream(flow, nodeId) {
-    var run = state.flows.run;
-    flowDownstream(flow, nodeId).forEach(function (id) {
-      var node = flow.nodes.find(function (item) { return item.id === id; });
-      if (node && run.nodes[id] === "待执行") {
-        run.nodes[id] = "已跳过";
-        flowLog("— 跳过：" + node.name);
-      }
-    });
-  }
-
-  function continueFlowCheckpoint(nodeId, pass) {
-    var run = state.flows.run;
-    var flow = activeFlow();
-    if (!run || !flow || run.flowId !== flow.id || run.nodes[nodeId] !== "等待确认") return;
-    var node = flow.nodes.find(function (item) { return item.id === nodeId; });
-    run.active = true;
-    run.status = "进行中";
-    if (pass) {
-      run.nodes[nodeId] = "成功";
-      flowLog("✓ " + (node ? node.name : "检查点") + "：人工确认通过", "ok");
-      renderFlowStates();
-      drawFlowEdges();
-      stepFlowRun();
-    } else {
-      run.nodes[nodeId] = "失败";
-      flowLog("✕ " + (node ? node.name : "检查点") + "：人工终止", "error");
-      skipFlowDownstream(flow, nodeId);
-      finishFlowRun();
-    }
-  }
-
-  function finishFlowRun() {
-    var run = state.flows.run;
-    var flow = activeFlow();
-    if (!run) return;
-    run.active = false;
-    var failed = Object.keys(run.nodes).some(function (id) { return run.nodes[id] === "失败"; });
-    run.status = failed ? "失败" : "成功";
-    run.durationMs = run.startMs ? Date.now() - run.startMs : 0;
-    flow.nodes.forEach(function (node) { if (run.nodes[node.id] === "待执行") run.nodes[node.id] = "已跳过"; });
-    flowLog(failed ? "■ 编排结束：失败" : "■ 编排结束：成功", failed ? "error" : "ok");
-    if (flow) {
-      flow.runs = flow.runs || [];
-      flow.runs.unshift({
-        id: run.id,
-        status: run.status,
-        trg: run.trg,
-        startedAt: run.startedAt,
-        endedAt: new Date().toISOString(),
-        durationMs: run.durationMs,
-        nodes: Object.assign({}, run.nodes),
-        log: run.log.slice(-200)
-      });
-      flow.runs = flow.runs.slice(0, 30);
-      persistFlowRun(flow, true);
-    }
-    renderFlowStates();
-    drawFlowEdges();
-    toast(failed ? "编排运行失败：可从失败节点重试或在设置里调整后重跑" : "编排运行成功", failed);
-  }
-
-  // 通知联动：新增待处理缺陷时，自动运行启用了“缺陷自动触发”的编排。
-  function maybeAutoRunFlows(items) {
-    if (!state.flows.loaded) {
-      loadFlows().then(function () { maybeAutoRunFlows(items); }).catch(function () {});
-      return;
-    }
-    var first = (items || []).find(function (item) { return item && item.id; });
-    if (!first) return;
-    state.flows.items.forEach(function (flow) {
-      if (!flow.on || !flow.autoRun) return;
-      if (state.flows.run && state.flows.run.active) return;
-      var hasDefectTrigger = flow.nodes.some(function (node) {
-        return node.tp === "trg-item" && (node.cfg.tp === "缺陷" || !node.cfg.tp);
-      });
-      if (!hasDefectTrigger) return;
-      toast("检测到新增缺陷，自动运行编排「" + flow.name + "」");
-      startFlowRun(flow, { defectId: first.id, serialNumber: first.serialNumber || "" });
-    });
+    // 旧画布只读：执行状态已迁移到规则引擎的运行台账，这里保留空实现以兼容绘制入口。
   }
 
   function mount(container) {
@@ -3794,11 +3658,6 @@ function createWorkspace(onRequestClose, notifier, services) {
     main = node("main", "dyx-main"); head.append(nav, expandButton, closeButton); body.append(main); shell.append(head, body); root.append(shell); (container || document.body).append(root);
     if (notifier) unsubscribeNotifier = notifier.subscribe(function () {
       if (root && state.tab === "defects") render();
-      // 新增待处理缺陷时，自动运行启用了“缺陷自动触发”的编排。
-      var snapshot = notifier ? notifier.snapshot() : null;
-      if (root && snapshot && snapshot.lastAddedCount > 0 && Array.isArray(snapshot.lastAddedItems) && snapshot.lastAddedItems.length) {
-        maybeAutoRunFlows(snapshot.lastAddedItems);
-      }
     });
     render();
     loadState().then(function () {
@@ -3806,7 +3665,13 @@ function createWorkspace(onRequestClose, notifier, services) {
       if (state.tab === "defects" && selectedProject()) { loadDefects(); loadDefectFilterOptions(); }
       else if (state.tab === "pipelines" && selectedProject()) loadPipelines();
       else if (state.tab === "dashboard") loadDashboard();
-      if (state.tab === "flows") loadFlows();
+      if (state.tab === "flows") {
+        loadFlows();
+        loadPolicies();
+        loadRuns();
+        loadEngineStatus();
+        startFlowsPolling();
+      }
     }).catch(function (error) { toast(error.message, true); });
     // 视口尺寸变化：缺陷页每页条数按新宽高重算（防抖 350ms），变化时重新加载列表。
     onViewportResize = function () {
@@ -3832,8 +3697,7 @@ function createWorkspace(onRequestClose, notifier, services) {
     if (onViewportResize) window.removeEventListener("resize", onViewportResize);
     onViewportResize = null;
     if (defectResizeTimer) { clearTimeout(defectResizeTimer); defectResizeTimer = null; }
-    if (saveFlowSoon.timer) { clearTimeout(saveFlowSoon.timer); saveFlowSoon.timer = null; }
-    if (persistRunTimer) { clearTimeout(persistRunTimer); persistRunTimer = null; }
+    if (stopFlowsPolling) stopFlowsPolling();
     root = null;
   }
 

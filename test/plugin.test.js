@@ -10,6 +10,7 @@ import {
   apply,
   createApiClient,
   createJsonStore,
+  createPolicyEngine,
   createRpc,
   detectNotificationChannel,
   extractStatuses,
@@ -18,9 +19,13 @@ import {
   mapDefect,
   mapPipelineRun,
   normalizeDefectNotification,
+  normalizeFlow,
+  normalizePolicy,
+  normalizeRun,
   openMacNotificationSettings,
   openSystemNotificationSettings,
   openWindowsNotificationSettings,
+  policyMatches,
   resolveSystemChannel,
   showMacNotification,
   showSystemNotification,
@@ -1093,24 +1098,38 @@ test("client wires workspace binding and the defect handle flow", async () => {
   assert.doesNotMatch(source, /"图片" \+ \(alt/);
 });
 
-test("v3 workbench wires the new domains, full-page mode and the flow engine", async () => {
+test("v3 workbench wires the new domains, full-page mode and the policy-driven flows page", async () => {
   const source = await readFile(new URL("../dist/client.js", import.meta.url), "utf8");
   assert.match(source, /\["dashboard", "概览"\], \["defects", "工作项"\]/);
   assert.match(source, /dyx-right-panel/);
   assert.match(source, /FULL_MODE_STORAGE_KEY/);
   assert.match(source, /dataset\.full = FULL_MODE_ACTIVE \? "true" : "false"/);
   assert.match(source, /dyx-flow-canvas/);
-  assert.match(source, /function startFlowRun/);
-  assert.match(source, /function continueFlowCheckpoint/);
-  assert.match(source, /maybeAutoRunFlows\(snapshot\.lastAddedItems\)/);
+  // 客户端执行引擎已下线：执行全部收敛到宿主规则引擎。
+  assert.doesNotMatch(source, /function startFlowRun/);
+  assert.doesNotMatch(source, /function stepFlowRun/);
+  assert.doesNotMatch(source, /function executeFlowNode/);
+  assert.doesNotMatch(source, /function runFlowAgent/);
+  assert.doesNotMatch(source, /maybeAutoRunFlows/);
+  assert.doesNotMatch(source, /rpc\("flows\.run\.save"/);
+  assert.doesNotMatch(source, /rpc\("flows\.save"/);
+  // 编排页为规则驱动：规则 / 运行台账 / 待确认裁决 / 旧画布只读。
   assert.match(source, /rpc\("flows\.list"/);
-  assert.match(source, /rpc\("flows\.save"/);
-  assert.match(source, /rpc\("flows\.run\.save"/);
+  assert.match(source, /rpc\("policies\.list"/);
+  assert.match(source, /rpc\("policies\.save"/);
+  assert.match(source, /rpc\("policies\.test"/);
+  assert.match(source, /rpc\("runs\.list"/);
+  assert.match(source, /rpc\("runs\.confirm", \{ runId: run\.id, decision: decision \}/);
+  assert.match(source, /rpc\("engine\.status"/);
+  assert.match(source, /rpc\("engine\.scanNow"/);
+  assert.match(source, /dyx-flow-subtabs/);
+  assert.match(source, /旧版画布（只读）/);
+  assert.match(source, /renderInboxPage/);
   assert.match(source, /rpc\("code\.repos\.list"/);
   assert.match(source, /rpc\("code\.mrs\.list"/);
   assert.match(source, /rpc\("tests\.plans\.list"/);
   assert.match(source, /rpc\("packages\.repos\.list"/);
-  assert.match(source, /rpc\("system\.notification\.show", \{ title: "云效编排提醒"/);
+  assert.doesNotMatch(source, /title: "云效编排提醒"/);
 });
 
 test("code, tests and packages lists mirror the pipeline grid with pagination", async () => {
@@ -1278,4 +1297,453 @@ test("codeup repositories, merge requests and merge use the organization contrac
   await client.mergeCodeupMergeRequest(account, "org/demo-app", "512");
   const merge = calls.find((item) => item.url.endsWith("/merge"));
   assert.equal(merge.method, "POST");
+});
+
+// —— 规则引擎：匹配器 / 清洗 / 引擎状态机 / RPC ——————————————————————————————
+
+function enginePolicy(overrides = {}) {
+  return normalizePolicy({
+    id: "p1",
+    name: "样式自动修复",
+    enabled: true,
+    trigger: { statusKinds: ["pending"], pollMinutes: 5, backfill: false },
+    match: { keywordsAny: ["样式", "错位"], keywordsNone: ["支付"], priorityCeiling: "P2" },
+    mode: "auto-submit",
+    instructions: "只改前端展示层",
+    agent: { preset: "standard", permissionPreset: "auto-fix", maxMinutes: 30 },
+    submit: {
+      repoId: "123", baseBranch: "develop", branchPattern: "fix/{serial}-{slug}",
+      createMr: true, mrTarget: "develop", maxChangedFiles: 30, forbiddenPaths: ["**/payment/**"]
+    },
+    writeback: { comment: true, statusOnSuccess: "已修复", statusOnConfirm: "处理中" },
+    ...overrides
+  });
+}
+
+function makeEngineStore() {
+  const state = {
+    selectedAccountId: "a1",
+    accounts: [{
+      id: "a1", name: "主账号", organizationId: "org1", token: "tok",
+      selectedProject: { id: "prj1", name: "演示项目" },
+      projectSettings: { prj1: { workspace: { id: "ws1", title: "工作区", path: "/tmp/ws" } } }
+    }],
+    policies: [], runs: [], runsSeen: {}
+  };
+  return {
+    state,
+    async listPolicies() { return state.policies; },
+    async savePolicy(input) {
+      const policy = normalizePolicy({ ...input, order: state.policies.length });
+      state.policies.push(policy);
+      return policy;
+    },
+    async markPolicyScanned(policyId, at) {
+      const policy = state.policies.find((item) => item.id === policyId);
+      if (policy) policy.lastScanAt = at;
+    },
+    async markSeen(defectId, info) {
+      state.runsSeen[defectId] = {
+        runId: info?.runId || "", policyId: info?.policyId || "",
+        at: info?.at || new Date().toISOString(), fingerprint: info?.fingerprint || "", outcome: info?.outcome || ""
+      };
+    },
+    async markSeenBatch(entries) {
+      for (const entry of entries) {
+        if (!state.runsSeen[entry.defectId]) {
+          state.runsSeen[entry.defectId] = { runId: "", policyId: entry.policyId, at: new Date().toISOString(), fingerprint: entry.fingerprint, outcome: "snapshot" };
+        }
+      }
+    },
+    async saveRun(run) {
+      const index = state.runs.findIndex((item) => item.id === run.id);
+      if (index >= 0) state.runs[index] = { ...run };
+      else state.runs.unshift({ ...run });
+    },
+    async getRun(runId) { return state.runs.find((run) => run.id === runId) || null; },
+    async listRuns() { return state.runs; },
+    async reorderPolicies(ids) {
+      const byId = new Map(state.policies.map((item) => [item.id, item]));
+      state.policies = ids.map((id) => byId.get(id)).filter(Boolean);
+      return state.policies;
+    },
+    async deletePolicy(policyId) {
+      const index = state.policies.findIndex((item) => item.id === policyId);
+      if (index < 0) throw new Error("规则不存在");
+      state.policies.splice(index, 1);
+      return { ok: true };
+    },
+    async resolvePolicyScope() {
+      return { account: state.accounts[0], projectId: "prj1", workspace: state.accounts[0].projectSettings.prj1.workspace };
+    },
+    async load() { return state; }
+  };
+}
+
+function makeEngineApi(defectRows) {
+  const calls = [];
+  return {
+    calls,
+    async resolveNotificationStatuses() {
+      return [{ id: "s1", name: "待确认" }, { id: "s2", name: "再次打开" }];
+    },
+    async listDefects(account, projectId, query) {
+      return { items: defectRows.filter((row) => row.statusId === query.statusIds?.[0]) };
+    },
+    async getDefect(account, projectId, defectId) {
+      const row = defectRows.find((item) => item.id === defectId);
+      return {
+        defect: { ...row },
+        description: row.description || "",
+        comments: [], attachments: [], statuses: [], warning: ""
+      };
+    },
+    async createChangeRequest(account, repoId, input) {
+      calls.push(["mr", repoId, input.sourceBranch, input.targetBranch]);
+      return { localId: "mr-9", url: "https://codeup.example/mr/9" };
+    },
+    async createDefectComment(account, projectId, defectId, content) {
+      calls.push(["comment", defectId, content]);
+      return { id: "c1" };
+    },
+    async listDefectStatusOptions() {
+      return [{ id: "st-fixed", name: "已修复" }, { id: "st-doing", name: "处理中" }];
+    },
+    async updateDefectStatus(account, projectId, defectId, statusId) {
+      calls.push(["status", defectId, statusId]);
+      return {};
+    },
+    async updateDefectAssignee(account, projectId, defectId, assignedToId) {
+      calls.push(["assignee", defectId, assignedToId]);
+      return {};
+    }
+  };
+}
+
+// 假智能体：followup 后按提示词自动回一版 report；whenIdle 延迟 10ms 模拟整轮静止。
+function makeEngineSvc(options = {}) {
+  const created = [];
+  const svc = {
+    created,
+    permissionPresets: {
+      names: ["read-only", "workspace-write", "auto-fix"],
+      resolve(nameValue) {
+        const table = {
+          "read-only": { sandbox: "read-only", approval: "ask" },
+          "workspace-write": { sandbox: "workspace-write", approval: "ask" },
+          "auto-fix": { sandbox: "workspace-write", approval: "never" }
+        };
+        if (!table[nameValue]) throw new Error(`unknown preset ${nameValue}`);
+        return table[nameValue];
+      },
+      set() {}
+    },
+    agentPresets: {
+      async resolve(id) { return { id: id || "standard" }; },
+      async mount() {}
+    },
+    sessionTitle: { rename() {} },
+    workspaceRegistry: { async create(value) { return { path: value, async attachSession() {} }; } },
+    attachments: { async saveImages(inputs) { return inputs.map((item, index) => ({ attachmentId: `att-${index}` })); } },
+    agents: {
+      async create({ sessionId, setup }) {
+        const agentCtx = { tools: { register(def) { if (def.name === "yunxiao_report_result") handle.reportTool = def; } } };
+        const handle = {
+          sessionId,
+          reportTool: null,
+          prompts: [],
+          agent: {
+            session: { deriveMessages() { return []; } },
+            followup(message) {
+              const text = (message.content || []).filter((block) => block.type === "text").map((block) => block.text).join("");
+              handle.prompts.push(text);
+              if (options.report) {
+                queueMicrotask(() => handle.reportTool.execute(options.report(text), { concludeTurn() {} }));
+              }
+            },
+            whenIdle: options.hang
+              ? () => new Promise(() => {})
+              : () => new Promise((resolve) => setTimeout(resolve, 10)),
+            cancel() { handle.canceled = true; }
+          },
+          dispose() {}
+        };
+        await setup(agentCtx);
+        created.push(handle);
+        return handle;
+      }
+    }
+  };
+  return svc;
+}
+
+const AUTO_FIX_REPORT = {
+  outcome: "fixed",
+  summary: "已修复样式",
+  branch: "fix/bug-1-style",
+  commits: ["abc123"],
+  changedFiles: ["src/pages/order/Amount.vue"],
+  verify: [{ command: "pnpm lint", ok: true }]
+};
+
+function analyzeReport(text) {
+  return /只读诊断/.test(text)
+    ? { outcome: "analyzed", summary: "根因是映射缺失", plan: "补齐字段映射", risk: "低" }
+    : AUTO_FIX_REPORT;
+}
+
+test("policy matcher honors keyword exclusions, priority ceiling and workitem type", () => {
+  const policy = enginePolicy();
+  assert.equal(policyMatches(policy, { subject: "订单页金额样式错位", priority: "P1", workitemType: "缺陷" }).matched, true);
+  assert.equal(policyMatches(policy, { subject: "订单页金额样式错位", priority: "P3", workitemType: "缺陷" }).matched, false);
+  assert.equal(policyMatches(policy, { subject: "支付页样式错位", priority: "P1", workitemType: "缺陷" }).matched, false);
+  assert.equal(policyMatches(policy, { subject: "登录超时", priority: "P1", workitemType: "缺陷" }).matched, false);
+  // 无法解析优先级时不拦截（列表项可能缺优先级字段）。
+  assert.equal(policyMatches(policy, { subject: "样式问题", priority: "", workitemType: "缺陷" }).matched, true);
+  const typedPolicy = enginePolicy({ match: { keywordsAny: ["样式"], priorityCeiling: "P2", typeAny: ["缺陷"] } });
+  assert.equal(policyMatches(typedPolicy, { subject: "样式问题", priority: "P1", workitemType: "需求" }).matched, false);
+  assert.equal(policyMatches(typedPolicy, { subject: "样式问题", priority: "P1", workitemType: "缺陷" }).matched, true);
+});
+
+test("policy and run normalizers apply whitelist sanitization", () => {
+  const policy = normalizePolicy({ id: "p1", name: "规则", mode: "nonsense", match: { priorityCeiling: "p9" }, agent: { maxMinutes: 9999 }, submit: { branchPattern: "" } });
+  assert.equal(policy.mode, "analyze-confirm");
+  assert.equal(policy.match.priorityCeiling, "");
+  assert.equal(policy.agent.maxMinutes, 720);
+  assert.equal(policy.submit.branchPattern, "fix/{serial}-{slug}");
+  assert.equal(policy.trigger.statusKinds.join(","), "pending,reopened");
+
+  const run = normalizeRun({ id: "r1", status: "agent-running", result: { outcome: "fixed", verify: [{ command: "pnpm lint", ok: true }] } });
+  assert.equal(run.status, "interrupted");
+  assert.equal(run.result.outcome, "fixed");
+  assert.equal(run.result.verify.length, 1);
+  assert.equal(normalizeRun({ id: "" }), null);
+});
+
+test("flow whitelist keeps act-pipe nodes of the default template", () => {
+  const flow = normalizeFlow({
+    id: "f1",
+    name: "缺陷自动修复流",
+    nodes: [
+      { id: "n1", tp: "trg-item", name: "触发", x: 0, y: 0, cfg: {} },
+      { id: "n5", tp: "op-cond", name: "是否修复成功", x: 200, y: 20, cfg: {} },
+      { id: "n6", tp: "act-pipe", name: "运行流水线", x: 8, y: 168, cfg: { pipe: "p1", br: "自动" } }
+    ],
+    edges: [
+      { f: "n1", t: "n5" },
+      { f: "n5", t: "n6", label: "是" }
+    ]
+  });
+  assert.ok(flow, "flow should normalize");
+  assert.ok(flow.nodes.some((node) => node.tp === "act-pipe"), "act-pipe node must survive");
+  assert.equal(flow.edges.length, 2, "edges to act-pipe must survive");
+});
+
+test("policy engine runs the auto-submit pipeline end to end", async (t) => {
+  const store = makeEngineStore();
+  const api = makeEngineApi([
+    { id: "d1", serialNumber: "bug-1", subject: "订单页金额样式错位", statusId: "s1", statusName: "待确认", workitemType: "缺陷", priority: "P1", gmtModified: "2026-10-21" }
+  ]);
+  const notifications = [];
+  const engine = createPolicyEngine({
+    store, api,
+    notify: async (title, body) => { notifications.push(`${title}|${body}`); },
+    timeScale: 0.001
+  });
+  await store.savePolicy(enginePolicy());
+  engine.start(makeEngineSvc({ report: () => AUTO_FIX_REPORT }));
+  t.after(() => engine.stop());
+  await new Promise((resolve) => setTimeout(resolve, 30));
+
+  // 首轮（backfill=false）只做快照，不产生运行。
+  assert.equal(store.state.runs.length, 0);
+  assert.equal(store.state.runsSeen.d1.outcome, "snapshot");
+
+  // 指纹变化后（缺陷转为"再次打开"）正常入队并完成 auto-submit。
+  api.listDefects = async (account, projectId, query) => (
+    query.statusIds?.[0] === "s1"
+      ? { items: [{ id: "d1", serialNumber: "bug-1", subject: "订单页金额样式错位", statusId: "s2", statusName: "再次打开", workitemType: "缺陷", priority: "P1", gmtModified: "2026-10-22" }] }
+      : { items: [] }
+  );
+  for (const policy of store.state.policies) policy.lastScanAt = new Date(Date.now() - 10 * 60_000).toISOString();
+  const scan = await engine.scanOnce();
+  assert.equal(scan.results[0].matched, 1);
+  await new Promise((resolve) => setTimeout(resolve, 60));
+
+  const run = store.state.runs[0];
+  assert.equal(run.status, "succeeded");
+  assert.equal(run.mode, "auto-submit");
+  assert.equal(run.result.mrUrl, "https://codeup.example/mr/9");
+  assert.deepEqual(run.steps.map((step) => step.name), ["fetching", "classifying", "agent-running", "submitting", "writeback", "succeeded"]);
+  assert.ok(api.calls.some(([kind, repoId, sourceBranch, targetBranch]) => kind === "mr" && targetBranch === "develop" && sourceBranch === "fix/bug-1-style"));
+  assert.ok(api.calls.some(([kind, , statusId]) => kind === "status" && statusId === "st-fixed"));
+  assert.ok(api.calls.some(([kind]) => kind === "comment"));
+  assert.ok(notifications.some((line) => line.includes("bug-1")));
+  assert.equal(engine.status().available, true);
+  // 台账指向本次运行，冷却期内同指纹不再重跑。
+  assert.equal(store.state.runsSeen.d1.runId, run.id);
+  store.state.policies[0].lastScanAt = new Date(Date.now() - 10 * 60_000).toISOString();
+  await engine.scanOnce();
+  await new Promise((resolve) => setTimeout(resolve, 30));
+  assert.equal(store.state.runs.length, 1, "same fingerprint must not retrigger");
+});
+
+test("policy engine parks analyze-confirm runs and resumes after approval", async (t) => {
+  const store = makeEngineStore();
+  const api = makeEngineApi([
+    { id: "d2", serialNumber: "bug-2", subject: "结算接口报错 500", statusId: "s1", statusName: "待确认", workitemType: "缺陷", priority: "P1", gmtModified: "2026-10-22", description: "C 端下单接口报错" }
+  ]);
+  const engine = createPolicyEngine({ store, api, notify: async () => ({}), timeScale: 0.001 });
+  await store.savePolicy(enginePolicy({
+    id: "p2", name: "后台逻辑分析", mode: "analyze-confirm", trigger: { statusKinds: ["pending"], pollMinutes: 5, backfill: true },
+    match: { keywordsAny: ["报错"] }, submit: { createMr: false }, writeback: { comment: true, statusOnConfirm: "处理中" }
+  }));
+  engine.start(makeEngineSvc({ report: analyzeReport }));
+  t.after(() => engine.stop());
+  await new Promise((resolve) => setTimeout(resolve, 30));
+
+  const run = store.state.runs[0];
+  assert.equal(run.status, "awaiting-confirm");
+  assert.equal(run.result.outcome, "analyzed");
+  assert.ok(api.calls.some(([kind, , statusId]) => kind === "status" && statusId === "st-doing"));
+
+  // 未裁决前重复裁决 / 错误状态都会被拒绝。
+  await assert.rejects(() => engine.confirmRun(run.id, "nonsense"), /未知裁决/);
+
+  const approved = await engine.confirmRun(run.id, "approve");
+  assert.equal(approved.status, "agent-running");
+  await new Promise((resolve) => setTimeout(resolve, 80));
+  const resumed = store.state.runs.find((item) => item.id === run.id);
+  assert.equal(resumed.status, "succeeded");
+  assert.equal(resumed.result.outcome, "fixed");
+  assert.equal(resumed.result.branch, "fix/bug-1-style");
+  assert.ok(api.calls.filter(([kind]) => kind === "mr").length === 0, "createMr=false must not create MRs");
+  // 批准消息进入了同一会话。
+  const handle = engine.status;
+  assert.ok(store.state.runsSeen.d2.runId === run.id);
+});
+
+test("policy engine cancels a hung agent run and records cooldown skips", async (t) => {
+  const store = makeEngineStore();
+  const api = makeEngineApi([
+    { id: "d3", serialNumber: "bug-3", subject: "样式错位第三例", statusId: "s1", statusName: "待确认", workitemType: "缺陷", priority: "P2", gmtModified: "2026-10-23" }
+  ]);
+  const engine = createPolicyEngine({ store, api, notify: async () => ({}), timeScale: 0.001 });
+  await store.savePolicy(enginePolicy({ trigger: { statusKinds: ["pending"], pollMinutes: 5, backfill: true } }));
+  engine.start(makeEngineSvc({ hang: true }));
+  t.after(() => engine.stop());
+  await new Promise((resolve) => setTimeout(resolve, 30));
+  assert.equal(store.state.runs[0].status, "agent-running");
+  await engine.cancelRun(store.state.runs[0].id);
+  await new Promise((resolve) => setTimeout(resolve, 30));
+  assert.equal(store.state.runs[0].status, "canceled");
+  assert.equal(store.state.runsSeen.d3.outcome, "canceled");
+});
+
+test("policy engine falls back to needs-human on agent timeout and guardrail violations", async (t) => {
+  const store = makeEngineStore();
+  const api = makeEngineApi([
+    { id: "d4", serialNumber: "bug-4", subject: "样式超时用例", statusId: "s1", statusName: "待确认", workitemType: "缺陷", priority: "P2", gmtModified: "2026-10-24" }
+  ]);
+  const engine = createPolicyEngine({ store, api, notify: async () => ({}), timeScale: 0.001 });
+  await store.savePolicy(enginePolicy({ agent: { preset: "standard", maxMinutes: 1 }, trigger: { statusKinds: ["pending"], pollMinutes: 5, backfill: true } }));
+  engine.start(makeEngineSvc({ hang: true }));
+  t.after(() => engine.stop());
+  await new Promise((resolve) => setTimeout(resolve, 1400));
+  const run = store.state.runs[0];
+  assert.equal(run.status, "needs-human");
+  assert.match(run.error, /超过 1 分钟/);
+});
+
+test("guardrails reject out-of-scope changes before any MR is created", () => {
+  const policy = enginePolicy();
+  // 通过 RPC 侧的 checkSubmitGuardrails 逻辑由引擎内部调用；这里以引擎私有行为等价验证：
+  // 直接驱动一个 auto-submit 运行，报告命中禁改路径 → 需人工且不建 MR。
+  const store = makeEngineStore();
+  const api = makeEngineApi([
+    { id: "d5", serialNumber: "bug-5", subject: "样式越界用例", statusId: "s1", statusName: "待确认", workitemType: "缺陷", priority: "P1", gmtModified: "2026-10-25" }
+  ]);
+  const engine = createPolicyEngine({ store, api, notify: async () => ({}), timeScale: 0.001 });
+  return store.savePolicy(enginePolicy({ trigger: { statusKinds: ["pending"], pollMinutes: 5, backfill: true } })).then(async () => {
+    engine.start(makeEngineSvc({
+      report: () => ({
+        ...AUTO_FIX_REPORT,
+        changedFiles: ["src/payment/settle.vue", "src/pages/order/Amount.vue"]
+      })
+    }));
+    await new Promise((resolve) => setTimeout(resolve, 60));
+    const run = store.state.runs[0];
+    assert.equal(run.status, "needs-human");
+    assert.match(run.error, /禁改路径/);
+    assert.equal(api.calls.some(([kind]) => kind === "mr"), false, "guardrail violation must not create an MR");
+  });
+});
+
+test("policy RPC validates writes, tests matching and reports engine availability", async (t) => {
+  const store = makeEngineStore();
+  const api = makeEngineApi([
+    { id: "d6", serialNumber: "bug-6", subject: "订单样式错位", statusId: "s1", statusName: "待确认", workitemType: "缺陷", priority: "P1", gmtModified: "2026-10-26" }
+  ]);
+  const rpc = createRpc(store, api, async () => ({}), () => [], null);
+
+  // 缺少数字仓库 ID 的 auto-submit 规则会被保存校验拦下。
+  await assert.rejects(
+    () => rpc("policies.save", { policy: enginePolicy({ submit: { repoId: "", createMr: true } }) }),
+    /数字 ID/
+  );
+  // 回写状态名必须存在于项目工作流。
+  await assert.rejects(
+    () => rpc("policies.save", { policy: enginePolicy({ writeback: { statusOnSuccess: "不存在的状态" } }) }),
+    /不存在状态/
+  );
+  const saved = await rpc("policies.save", { policy: enginePolicy() });
+  assert.equal(saved.name, "样式自动修复");
+  const listed = await rpc("policies.list", {});
+  assert.equal(listed.items.length, 1);
+  const reordered = await rpc("policies.reorder", { ids: [saved.id] });
+  assert.equal(reordered.items[0].id, saved.id);
+  const orderAfterDelete = await rpc("policies.delete", { policyId: saved.id });
+  assert.equal(orderAfterDelete.ok, true);
+
+  // 试运行匹配：命中样式缺陷并给出将采取的模式。
+  const test = await rpc("policies.test", { policy: enginePolicy() });
+  assert.equal(test.total, 1);
+  assert.equal(test.matched, 1);
+  assert.equal(test.items[0].mode, "auto-submit");
+  assert.equal(test.items[0].serialNumber, "bug-6");
+
+  // 引擎未注入时给出明确错误与状态。
+  await assert.rejects(() => rpc("runs.cancel", { runId: "r9" }), /引擎不可用/);
+  await assert.rejects(() => rpc("runs.retry", { runId: "r9" }), /引擎不可用/);
+  await assert.rejects(() => rpc("runs.confirm", { runId: "r9", decision: "approve" }), /引擎不可用/);
+  await assert.rejects(() => rpc("engine.scanNow", {}), /引擎不可用/);
+  const engineStatus = await rpc("engine.status", {});
+  assert.equal(engineStatus.available, false);
+});
+
+test("createChangeRequest sends the numeric-repository MR contract", async (t) => {
+  const previousFetch = globalThis.fetch;
+  const calls = [];
+  t.after(() => { globalThis.fetch = previousFetch; });
+  globalThis.fetch = async (url, options = {}) => {
+    calls.push({ url: String(url), method: options.method || "GET", body: options.body });
+    if (String(url).endsWith("/repositories/123/changeRequests") && options.method === "POST") {
+      return new Response(JSON.stringify({ localId: 77, detailUrl: "https://codeup.example/mr/77", status: "OPEN" }), { status: 200, headers: { "content-type": "application/json" } });
+    }
+    throw new Error(`unexpected request: ${options.method || "GET"} ${url}`);
+  };
+  const client = createApiClient({ apiBaseUrl: "https://openapi-rdc.aliyuncs.com", timeoutMs: 5000 });
+  const account = { organizationId: "org-1", token: "token" };
+
+  await assert.rejects(() => client.createChangeRequest(account, "org/demo", { sourceBranch: "fix/x", targetBranch: "main", title: "t" }), /数字 ID/);
+  const mr = await client.createChangeRequest(account, "123", {
+    sourceBranch: "fix/bug-1-style", targetBranch: "develop", title: "fix(bug-1): 样式",
+    description: "自动修复", workItemIds: ["d1"]
+  });
+  assert.equal(mr.localId, "77");
+  assert.equal(mr.url, "https://codeup.example/mr/77");
+  const body = JSON.parse(calls[0].body);
+  assert.equal(body.sourceProjectId, 123);
+  assert.equal(body.targetProjectId, 123);
+  assert.equal(body.workItemIds, "d1");
 });
