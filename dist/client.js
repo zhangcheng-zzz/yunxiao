@@ -272,11 +272,13 @@ var CSS = [
   ".dyx-flow-readonly-note{margin:0;padding:10px 14px;border-bottom:1px solid var(--dyx-line);border-radius:0}",
   // 编排子页签（规则 / 运行记录 / 待确认 / 旧版画布），复用导航按钮的观感但更轻量。
   ".dyx-flow-subtabs{display:flex;gap:6px;flex-wrap:wrap;margin:12px 0}.dyx-flow-subtabs button{display:inline-flex;align-items:center;gap:6px;min-height:34px;padding:6px 14px;border:0;border-radius:999px;background:var(--dyx-tag);cursor:pointer;font:inherit;font-size:12.5px;color:var(--dyx-muted)}.dyx-flow-subtabs button:hover{background:var(--dyx-hover)}.dyx-flow-subtabs button.active{background:var(--dyx-brand-weak);color:var(--dyx-brand);font-weight:600}",
-  // 规则编辑抽屉：fieldset 分组（触发 / 匹配 / 处理方式 / 提交与回写）。
+  // 规则编辑抽屉：分组面板（触发 / 匹配 / 处理方式 / 提交与回写），标题在框内渲染。
   ".dyx-policy-form{display:flex;flex-direction:column;gap:14px}",
   ".dyx-policy-group{margin:0;padding:12px 14px 14px;border:1px solid var(--dyx-line);border-radius:14px;background:var(--dyx-panel2)}",
-  ".dyx-policy-group legend{padding:0 6px;color:var(--dyx-muted);font-size:11.5px;font-weight:600}",
-  ".dyx-policy-group .dyx-field{margin-top:10px}.dyx-policy-group .dyx-notify-toggle{margin-right:10px}",
+  ".dyx-policy-group-title{margin:0;color:var(--dyx-muted);font-size:11.5px;font-weight:600}",
+  ".dyx-policy-group .dyx-field{margin-top:10px}.dyx-policy-group .dyx-textarea-compact{min-height:56px}",
+  ".dyx-policy-group .dyx-notify-toggle{margin-top:10px;margin-right:10px;background:var(--dyx-panel)}",
+  ".dyx-policy-modes{flex-wrap:wrap;gap:10px}.dyx-policy-modes .dyx-notify-toggle{margin-top:10px}.dyx-policy-modes .dyx-notify-toggle span{font-size:12.5px}",
   ".dyx-flow-glyph{width:24px;height:24px;flex:none;display:grid;place-items:center;border-radius:8px;color:#fff;font-size:13px}",
   ".dyx-flow-canvas{position:relative;height:640px;overflow:auto;background:radial-gradient(circle,var(--dyx-line) 1px,transparent 1px);background-size:18px 18px;scrollbar-width:thin;touch-action:none}",
   ".dyx-flow-stage{position:relative;min-width:640px;min-height:600px;height:100%}",
@@ -3059,8 +3061,8 @@ function createWorkspace(onRequestClose, notifier, services) {
     var followScope = !base.scope.accountId && !base.scope.projectId;
 
     function group(titleText) {
-      var box = node("fieldset", "dyx-policy-group");
-      box.append(node("legend", "", titleText));
+      var box = node("div", "dyx-policy-group");
+      box.append(node("h4", "dyx-policy-group-title", titleText));
       return box;
     }
     function textField(labelText, value, placeholder, onChange) {
@@ -3078,6 +3080,7 @@ function createWorkspace(onRequestClose, notifier, services) {
     function areaField(labelText, value, placeholder, onChange) {
       var control = input("textarea", placeholder || "", (value || []).join("，"));
       control.rows = 2;
+      control.classList.add("dyx-textarea-compact");
       control.addEventListener("change", function () {
         onChange(control.value.split(/[\n,，;；]/).map(function (item) { return item.trim(); }).filter(Boolean));
       });
@@ -3154,17 +3157,25 @@ function createWorkspace(onRequestClose, notifier, services) {
     var head3 = group("处理方式");
     var modeRow = node("div", "dyx-field");
     modeRow.append(node("label", "", "模式"));
-    var modeWrap = node("div", "dyx-actions");
+    var modeWrap = node("div", "dyx-actions dyx-policy-modes");
+    var modeHint = node("div", "dyx-note", POLICY_MODE_META[base.mode] ? POLICY_MODE_META[base.mode].hint : "");
     Object.keys(POLICY_MODE_META).forEach(function (mode) {
-      modeWrap.append(checkField(POLICY_MODE_META[mode].label, base.mode === mode, function (checked) {
-        if (checked) {
-          base.mode = mode;
-          Array.from(modeWrap.querySelectorAll("input")).forEach(function (control) { control.checked = control.parentNode.textContent.indexOf(POLICY_MODE_META[mode].label) >= 0; });
-        }
-      }));
+      // 单选语义用真正的 radio 表达，避免勾选框互相反选的手工同步。
+      var radio = input("radio");
+      radio.name = "dyx-policy-mode";
+      radio.value = mode;
+      radio.checked = base.mode === mode;
+      radio.addEventListener("change", function () {
+        if (!radio.checked) return;
+        base.mode = mode;
+        modeHint.textContent = POLICY_MODE_META[mode].hint || "";
+      });
+      var modeToggle = node("label", "dyx-notify-toggle dyx-policy-mode-toggle");
+      modeToggle.append(node("span", "", POLICY_MODE_META[mode].label), radio);
+      modeWrap.append(modeToggle);
     });
     modeRow.append(modeWrap);
-    head3.append(modeRow, node("div", "dyx-note", POLICY_MODE_META[base.mode] ? POLICY_MODE_META[base.mode].hint : ""));
+    head3.append(modeRow, modeHint);
     var instructions = input("textarea", "写给智能体的自由文本规则，会原样注入并最高优先级遵守", base.instructions);
     instructions.rows = 4;
     instructions.addEventListener("change", function () { base.instructions = instructions.value; });
