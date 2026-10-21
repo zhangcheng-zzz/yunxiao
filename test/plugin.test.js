@@ -1092,3 +1092,190 @@ test("client wires workspace binding and the defect handle flow", async () => {
   assert.doesNotMatch(source, /"附件：" \+ files/);
   assert.doesNotMatch(source, /"图片" \+ \(alt/);
 });
+
+test("v3 workbench wires the new domains, full-page mode and the flow engine", async () => {
+  const source = await readFile(new URL("../dist/client.js", import.meta.url), "utf8");
+  assert.match(source, /\["dashboard", "概览"\], \["defects", "工作项"\]/);
+  assert.match(source, /dyx-right-panel/);
+  assert.match(source, /FULL_MODE_STORAGE_KEY/);
+  assert.match(source, /dataset\.full = FULL_MODE_ACTIVE \? "true" : "false"/);
+  assert.match(source, /dyx-flow-canvas/);
+  assert.match(source, /function startFlowRun/);
+  assert.match(source, /function continueFlowCheckpoint/);
+  assert.match(source, /maybeAutoRunFlows\(snapshot\.lastAddedItems\)/);
+  assert.match(source, /rpc\("flows\.list"/);
+  assert.match(source, /rpc\("flows\.save"/);
+  assert.match(source, /rpc\("flows\.run\.save"/);
+  assert.match(source, /rpc\("code\.repos\.list"/);
+  assert.match(source, /rpc\("code\.mrs\.list"/);
+  assert.match(source, /rpc\("tests\.plans\.list"/);
+  assert.match(source, /rpc\("packages\.repos\.list"/);
+  assert.match(source, /rpc\("system\.notification\.show", \{ title: "云效编排提醒"/);
+});
+
+test("code, tests and packages lists mirror the pipeline grid with pagination", async () => {
+  const source = await readFile(new URL("../dist/client.js", import.meta.url), "utf8");
+  // 三个视图共用与流水线同规格的方格网格 + 分页器；代码页带关键词搜索。
+  const codeView = source.slice(source.indexOf("function renderCode"), source.indexOf("function repoGrid"));
+  assert.match(codeView, /dyx-statstrip/);
+  assert.match(codeView, /dyx-list-toolbar/);
+  assert.match(codeView, /pager\(state\.code, onRepoPage\)/);
+  assert.match(codeView, /state\.code\.keyword = keyword\.value\.trim\(\)/);
+  assert.match(codeView, /event\.key === "Enter"/);
+  assert.match(codeView, /repoGrid\(items\)/);
+  const testsView = source.slice(source.indexOf("function renderTests"), source.indexOf("function planGrid"));
+  assert.match(testsView, /dyx-statstrip/);
+  assert.match(testsView, /pager\(state\.tests, onPlanPage\)/);
+  assert.match(testsView, /planGrid\(items\)/);
+  const packagesView = source.slice(source.indexOf("function renderPackages"), source.indexOf("function packageGrid"));
+  assert.match(packagesView, /dyx-statstrip/);
+  assert.match(packagesView, /pager\(state\.packages, onPackagePage\)/);
+  assert.match(packagesView, /packageGrid\(items\)/);
+  assert.match(source, /function packageRepoKind/);
+  assert.match(source, /dyx-tile-grid\{grid-template-columns:repeat\(auto-fill,minmax\(288px,1fr\)\);gap:11px\}/);
+  // 服务端调用带上分页参数；代码库附带 search 关键词。
+  assert.match(source, /rpcArgs\(\{ page: state\.code\.page, pageSize: state\.code\.pageSize, search: state\.code\.keyword \}\)/);
+  assert.match(source, /rpcArgs\(\{ page: state\.tests\.page, pageSize: state\.tests\.pageSize \}\)/);
+  assert.match(source, /rpcArgs\(\{ page: state\.packages\.page, pageSize: state\.packages\.pageSize \}\)/);
+});
+
+test("pipeline run dialog renders immediately and survives branch read failures", async () => {
+  const source = await readFile(new URL("../dist/client.js", import.meta.url), "utf8");
+  const runForm = source.slice(source.indexOf("function openRunPipeline"), source.indexOf("function openPipelineRun"));
+  // 表单先渲染再异步补充分支控件；代码源控件插到“运行备注”之前。
+  assert.match(runForm, /var statusNote = node\("div", "dyx-note", "正在读取代码源与分支…"\)/);
+  assert.match(runForm, /form\.insertBefore\(sourceField, commentField\)/);
+  assert.match(runForm, /dialog\.foot\.append\(button\("取消", "", dialog\.close\), button\("确认运行", "primary", confirmRun\)\)/);
+  // 分支读取失败：保留可用的运行表单（手动分支输入），不再只有报错空态。
+  assert.match(runForm, /statusNote\.textContent = "代码源与分支读取失败："/);
+  assert.match(runForm, /manualBranchInput = input\("text", "留空使用流水线默认分支", ""\)/);
+  assert.match(runForm, /if \(manualBranchInput\) \{ var manualValue = manualBranchInput\.value\.trim\(\); if \(manualValue\) branchModeBranches\.push\(manualValue\); \}/);
+  assert.doesNotMatch(runForm, /代码源读取失败", error\.message/);
+});
+
+test("dashboard and settings adopt the shared stat strip and tile grids", async () => {
+  const source = await readFile(new URL("../dist/client.js", import.meta.url), "utf8");
+  // 概览：拉伸 tile 换成固定宽度统计卡；待处理缺陷复用工作项页卡片，编排改方格卡片并可直达对应画布。
+  const dashboard = source.slice(source.indexOf("function renderDashboard"), source.indexOf("function flowGrid"));
+  assert.match(dashboard, /dyx-statstrip/);
+  assert.match(dashboard, /defectTable\(pending\.slice\(0, DASHBOARD_PREVIEW_LIMIT\)\)/);
+  assert.match(dashboard, /flowGrid\(state\.flows\.items\.slice\(0, DASHBOARD_PREVIEW_LIMIT\)\)/);
+  assert.match(dashboard, /button\("查看全部", "", function \(\) \{ setTab\("defects"\); \}\)/);
+  assert.doesNotMatch(dashboard, /dyx-tiles|"dyx-tile"/);
+  const flowGrid = source.slice(source.indexOf("function flowGrid"), source.indexOf("function loadCodeRepos"));
+  assert.match(flowGrid, /dyx-record-list dyx-tile-grid/);
+  assert.match(flowGrid, /state\.flows\.active = index/);
+  // 设置：统计卡 + 账号方格卡片 + 项目/工作区双栏并排。
+  const settings = source.slice(source.indexOf("function renderOverview"), source.indexOf("function accountGrid"));
+  assert.match(settings, /dyx-statstrip/);
+  assert.match(settings, /accountGrid\(accounts\)/);
+  assert.match(settings, /var layout = node\("div", "dyx-settings-layout"\)/);
+  assert.match(settings, /renderWorkspaceBinding\(layout, account\)/);
+  const accountGrid = source.slice(source.indexOf("function accountGrid"), source.indexOf("function renderWorkspaceBinding"));
+  assert.match(accountGrid, /dyx-tile-card dyx-account/);
+  assert.match(accountGrid, /button\("设为当前", "dyx-btn-sm"/);
+  assert.match(source, /function renderWorkspaceBinding\(container, account\)/);
+  // 旧的拉伸 tile / 账号网格样式已删除，新增双栏布局与统计卡文本省略。
+  assert.doesNotMatch(source, /\.dyx-tiles\{|\.dyx-grid\{/);
+  assert.match(source, /\.dyx-settings-layout\{display:grid/);
+  assert.match(source, /@container\(min-width:920px\)\{\.dyx-settings-layout\{grid-template-columns:repeat\(2,minmax\(0,1fr\)\)\}\}/);
+  assert.match(source, /\.dyx-stat strong\{[^}]*text-overflow:ellipsis\}/);
+  // 概览里的内联状态修改也会触发刷新。
+  assert.match(source, /else if \(state\.tab === "dashboard"\) loadDashboard\(\);/);
+});
+
+test("flow definitions and runs persist with whitelist sanitization", async (t) => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "dsh-yunxiao-flows-"));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const store = createJsonStore(path.join(directory, "data.json"), 10);
+
+  const junkFlow = {
+    id: "flow-1",
+    name: "缺陷自动修复流",
+    on: 1,
+    autoRun: true,
+    trg: "缺陷单流转",
+    nodes: [
+      { id: "n1", tp: "trg-item", name: "触发", x: 1.2, y: -5, cfg: { tp: "缺陷", junk: { deep: true } } },
+      { id: "", tp: "trg-item", name: "应为空" },
+      { id: "n2", tp: "evil-type", name: "应为空" },
+      { id: "n1", tp: "op-cond", name: "重复 ID 应丢弃" }
+    ],
+    edges: [
+      { f: "n1", t: "n2" },
+      { f: "n1", t: "n9" },
+      { f: "n1", t: "n1" }
+    ],
+    runs: Array.from({ length: 40 }, (_, index) => ({ id: "r" + index, status: "成功" }))
+  };
+  const saved = await store.saveFlow(junkFlow);
+  assert.equal(saved.nodes.length, 1);
+  assert.equal(saved.nodes[0].id, "n1");
+  assert.equal(saved.nodes[0].y, 0);
+  assert.deepEqual(saved.nodes[0].cfg, { tp: "缺陷" });
+  assert.deepEqual(saved.edges, []);
+  assert.equal(saved.on, true);
+  assert.equal(saved.runs.length, 30);
+
+  const run = await store.saveFlowRun("flow-1", { id: "r-new", status: "进行中", nodes: { n1: "成功" }, log: [{ t: "1s", m: "x" }] });
+  assert.equal(run.id, "r-new");
+  const state = JSON.parse(await readFile(path.join(directory, "data.json"), "utf8"));
+  assert.equal(state.flows[0].runs[0].id, "r-new");
+  const again = await store.saveFlowRun("flow-1", { id: "r-new", status: "成功", nodes: { n1: "成功" }, log: [] });
+  assert.equal(again.status, "成功");
+  const storedRuns = (await store.listFlows())[0].runs;
+  assert.equal(storedRuns.length, 30);
+  assert.equal(storedRuns[0].id, "r-new");
+
+  await assert.rejects(() => store.saveFlow({ name: "" }), /编排名称不能为空/);
+  const autoId = await store.saveFlow({ name: "自动编号编排" });
+  assert.ok(autoId.id);
+  await assert.rejects(() => store.saveFlowRun("missing", { id: "r" }), /编排不存在/);
+  await store.deleteFlow("flow-1");
+  await assert.rejects(() => store.deleteFlow("flow-1"), /编排不存在/);
+  await store.deleteFlow(autoId.id);
+  assert.deepEqual(await store.listFlows(), []);
+});
+
+test("codeup repositories, merge requests and merge use the organization contract", async (t) => {
+  const previousFetch = globalThis.fetch;
+  const calls = [];
+  t.after(() => { globalThis.fetch = previousFetch; });
+  globalThis.fetch = async (url, options = {}) => {
+    const value = String(url);
+    calls.push({ url: value, method: options.method || "GET", body: options.body });
+    if (value.endsWith("/repositories?page=1&perPage=20&search=demo")) {
+      return new Response(JSON.stringify([
+        { id: 7, pathWithNamespace: "org/demo-app", name: "demo-app", default_branch: "main", description: "主站" },
+        { id: 8, path: "org/empty", name: "" }
+      ]), { status: 200, headers: { "content-type": "application/json", "x-total-count": "1" } });
+    }
+    if (value.endsWith("/repositories/org%2Fdemo-app/merge_requests?state=opened&page=1&perPage=20")) {
+      return new Response(JSON.stringify([
+        { id: 512, title: "修复验证码", state: "opened", source_branch: "feature/x", target_branch: "main", author_name: "张三" }
+      ]), { status: 200, headers: { "content-type": "application/json" } });
+    }
+    if (value.endsWith("/repositories/org%2Fdemo-app/merge_requests/512/merge") && options.method === "POST") {
+      return new Response(JSON.stringify({ ok: true }), { status: 200, headers: { "content-type": "application/json" } });
+    }
+    throw new Error(`unexpected request: ${options.method || "GET"} ${value}`);
+  };
+  const client = createApiClient({ apiBaseUrl: "https://openapi-rdc.aliyuncs.com", timeoutMs: 5000 });
+  const account = { organizationId: "org-1", token: "token" };
+
+  const repos = await client.listCodeupRepositories(account, { search: "demo" });
+  assert.equal(repos.items.length, 2);
+  assert.equal(repos.items[0].path, "org/demo-app");
+  assert.equal(repos.items[0].defaultBranch, "main");
+  // name 缺省时回退为仓库路径。
+  assert.equal(repos.items[1].name, "org/empty");
+
+  const mrs = await client.listCodeupMergeRequests(account, "org/demo-app", { state: "opened" });
+  assert.equal(mrs.items[0].id, "512");
+  assert.equal(mrs.items[0].sourceBranch, "feature/x");
+
+  await assert.rejects(() => client.mergeCodeupMergeRequest(account, "", "512"), /不能为空/);
+  await client.mergeCodeupMergeRequest(account, "org/demo-app", "512");
+  const merge = calls.find((item) => item.url.endsWith("/merge"));
+  assert.equal(merge.method, "POST");
+});

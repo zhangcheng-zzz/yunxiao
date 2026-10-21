@@ -81,7 +81,7 @@ function normalizeWorkspaceBinding(value) {
 }
 
 function emptyState() {
-  return { version: 1, selectedAccountId: "", accounts: [], cache: {}, system: null };
+  return { version: 1, selectedAccountId: "", accounts: [], cache: {}, system: null, flows: [], policies: [], runs: [], runsSeen: {} };
 }
 
 function normalizeSystemInfo(value) {
@@ -93,6 +93,324 @@ function normalizeSystemInfo(value) {
   return { platform, channel, detectedAt: cleanText(source.detectedAt, 40) };
 }
 
+// —— 编排流（画布定义 + 运行记录）的持久化结构 ————————————————————————————
+// 流程定义由客户端画布产出；宿主只负责白名单式清洗后存入数据文件，
+// 保证文件始终是可直接查看和备份的 JSON。
+const FLOW_NODE_TYPES = new Set([
+  "trg-item", "trg-pipe", "trg-cron", "op-cond", "op-delay",
+  "act-agent", "act-item", "act-mr", "act-pipe", "act-scan", "act-test", "act-deploy",
+  "ntf-msg", "ntf-comment"
+]);
+const FLOW_NODE_LIMIT = 64;
+const FLOW_EDGE_LIMIT = 128;
+const FLOW_RUNS_LIMIT = 30;
+const FLOW_LOG_LIMIT = 400;
+
+function normalizeFlowNode(value) {
+  const source = value && typeof value === "object" ? value : {};
+  const id = cleanText(source.id, 64);
+  const type = cleanText(source.tp, 40);
+  if (!id || !FLOW_NODE_TYPES.has(type)) return null;
+  const cfg = {};
+  if (source.cfg && typeof source.cfg === "object" && !Array.isArray(source.cfg)) {
+    for (const [key, item] of Object.entries(source.cfg).slice(0, 12)) {
+      const cleanKey = cleanText(key, 60);
+      // 只保留原始值：对象/数组一律丢弃，避免把垃圾结构存进数据文件。
+      if (!cleanKey || item === null || item === undefined || typeof item === "object") continue;
+      cfg[cleanKey] = cleanText(item, 2000);
+    }
+  }
+  return {
+    id,
+    tp: type,
+    name: cleanText(source.name, 200) || "节点",
+    x: clampInteger(source.x, 0, 0, 20_000),
+    y: clampInteger(source.y, 0, 0, 20_000),
+    cfg
+  };
+}
+
+function normalizeFlowEdge(value) {
+  const source = value && typeof value === "object" ? value : {};
+  const from = cleanText(source.f, 64);
+  const to = cleanText(source.t, 64);
+  if (!from || !to) return null;
+  return { f: from, t: to, label: cleanText(source.label, 12) };
+}
+
+function normalizeFlowRun(value) {
+  const source = value && typeof value === "object" ? value : {};
+  const nodes = {};
+  if (source.nodes && typeof source.nodes === "object" && !Array.isArray(source.nodes)) {
+    for (const [key, item] of Object.entries(source.nodes).slice(0, FLOW_NODE_LIMIT)) {
+      const status = cleanText(item, 20);
+      if (cleanText(key, 64) && status) nodes[cleanText(key, 64)] = status;
+    }
+  }
+  return {
+    id: cleanText(source.id, 64) || randomUUID(),
+    status: cleanText(source.status, 20) || "进行中",
+    trg: cleanText(source.trg, 200),
+    startedAt: cleanText(source.startedAt, 40),
+    endedAt: cleanText(source.endedAt, 40),
+    durationMs: clampInteger(source.durationMs, 0, 0, 2_147_483_647),
+    nodes,
+    log: (Array.isArray(source.log) ? source.log : []).slice(0, FLOW_LOG_LIMIT).map((entry) => ({
+      t: cleanText(entry?.t, 40),
+      m: cleanText(entry?.m, 500),
+      c: cleanText(entry?.c, 20)
+    }))
+  };
+}
+
+function normalizeFlow(value) {
+  const source = value && typeof value === "object" ? value : {};
+  const id = cleanText(source.id, 64);
+  const name = cleanText(source.name, 200);
+  if (!id || !name) return null;
+  const nodeIds = new Set();
+  const nodes = (Array.isArray(source.nodes) ? source.nodes : [])
+    .map(normalizeFlowNode)
+    .filter((node) => {
+      if (!node || nodeIds.has(node.id)) return false;
+      nodeIds.add(node.id);
+      return true;
+    })
+    .slice(0, FLOW_NODE_LIMIT);
+  const nodeSet = new Set(nodes.map((node) => node.id));
+  const edges = (Array.isArray(source.edges) ? source.edges : [])
+    .map(normalizeFlowEdge)
+    .filter((edge) => edge && edge.f !== edge.t && nodeSet.has(edge.f) && nodeSet.has(edge.t))
+    .slice(0, FLOW_EDGE_LIMIT);
+  return {
+    id,
+    name,
+    on: Boolean(source.on),
+    autoRun: Boolean(source.autoRun),
+    trg: cleanText(source.trg, 200),
+    nodes,
+    edges,
+    runs: (Array.isArray(source.runs) ? source.runs : []).map(normalizeFlowRun).slice(0, FLOW_RUNS_LIMIT),
+    createdAt: cleanText(source.createdAt, 40),
+    updatedAt: cleanText(source.updatedAt, 40)
+  };
+}
+
+function normalizeFlows(value) {
+  if (!Array.isArray(value)) return [];
+  const byId = new Map();
+  for (const item of value) {
+    const flow = normalizeFlow(item);
+    if (flow && !byId.has(flow.id)) byId.set(flow.id, flow);
+  }
+  return [...byId.values()];
+}
+
+// —— 规则引擎：处理规则（policy）与运行台账（run）———————————————————————
+// 规则由客户端表单产出，宿主白名单清洗后持久化；运行台账只由宿主引擎写入。
+const POLICY_MODES = new Set(["auto-submit", "analyze-confirm", "notify"]);
+const POLICY_STATUS_KINDS = new Set(["pending", "reopened"]);
+const POLICY_LIMIT = 50;
+const RUN_LIMIT = 200;
+const RUN_STEP_LIMIT = 40;
+const RUN_LOG_LIMIT = 400;
+const RUN_STATUSES = new Set([
+  "queued", "fetching", "classifying", "agent-running", "awaiting-confirm", "submitting", "writeback",
+  "succeeded", "needs-human", "failed", "skipped", "canceled", "interrupted"
+]);
+const RUN_ACTIVE_STATUSES = new Set(["queued", "fetching", "classifying", "agent-running", "awaiting-confirm", "submitting", "writeback"]);
+const REPORT_OUTCOMES = new Set(["fixed", "analyzed", "needs-human", "not-a-bug", "cannot-reproduce", "blocked"]);
+
+function cleanStringList(value, maxItems, maxLength) {
+  const source = Array.isArray(value) ? value : typeof value === "string" ? value.split(/[\n,，;；]/) : [];
+  const seen = new Set();
+  const result = [];
+  for (const item of source) {
+    const text = cleanText(item, maxLength);
+    if (!text || seen.has(text)) continue;
+    seen.add(text);
+    result.push(text);
+    if (result.length >= maxItems) break;
+  }
+  return result;
+}
+
+function booleanOr(value, fallback) {
+  return value === undefined || value === null ? fallback : Boolean(value);
+}
+
+function normalizePolicy(value) {
+  const source = value && typeof value === "object" ? value : {};
+  const id = cleanText(source.id, 64);
+  const name = cleanText(source.name, 200);
+  if (!id || !name) return null;
+  const pick = (key) => (source[key] && typeof source[key] === "object" && !Array.isArray(source[key]) ? source[key] : {});
+  const scope = pick("scope");
+  const trigger = pick("trigger");
+  const match = pick("match");
+  const agent = pick("agent");
+  const submit = pick("submit");
+  const writeback = pick("writeback");
+  const mode = cleanText(source.mode, 30);
+  const statusKinds = cleanStringList(trigger.statusKinds, 4, 20).filter((kind) => POLICY_STATUS_KINDS.has(kind));
+  const priorityCeiling = cleanText(match.priorityCeiling, 4).toUpperCase();
+  return {
+    id,
+    name,
+    enabled: Boolean(source.enabled),
+    order: clampInteger(source.order, 0, 0, 10_000),
+    scope: { accountId: cleanText(scope.accountId, 100), projectId: cleanText(scope.projectId, 128) },
+    trigger: {
+      statusKinds: statusKinds.length ? statusKinds : ["pending", "reopened"],
+      assigneeId: cleanText(trigger.assigneeId, 128),
+      pollMinutes: clampInteger(trigger.pollMinutes, 5, 1, 1440),
+      backfill: Boolean(trigger.backfill)
+    },
+    match: {
+      keywordsAny: cleanStringList(match.keywordsAny, 50, 100),
+      keywordsNone: cleanStringList(match.keywordsNone, 50, 100),
+      priorityCeiling: /^P[0-3]$/.test(priorityCeiling) ? priorityCeiling : "",
+      typeAny: cleanStringList(match.typeAny, 20, 100),
+      labelAny: cleanStringList(match.labelAny, 50, 100)
+    },
+    mode: POLICY_MODES.has(mode) ? mode : "analyze-confirm",
+    instructions: cleanTextPreserve(source.instructions, 8000).trim(),
+    agent: {
+      preset: cleanText(agent.preset, 100),
+      permissionPreset: cleanText(agent.permissionPreset, 100),
+      model: cleanText(agent.model, 200),
+      maxMinutes: clampInteger(agent.maxMinutes, 30, 1, 720)
+    },
+    submit: {
+      repoId: cleanText(submit.repoId, 64),
+      repoPath: cleanText(submit.repoPath, 500),
+      baseBranch: cleanText(submit.baseBranch, 255),
+      branchPattern: cleanText(submit.branchPattern, 255) || "fix/{serial}-{slug}",
+      push: booleanOr(submit.push, true),
+      createMr: booleanOr(submit.createMr, true),
+      mrTarget: cleanText(submit.mrTarget, 255),
+      mrTitle: cleanText(submit.mrTitle, 256) || "fix({serial}): {subject}",
+      pipelineId: cleanText(submit.pipelineId, 128),
+      verifyCommands: cleanStringList(submit.verifyCommands, 10, 500),
+      maxChangedFiles: clampInteger(submit.maxChangedFiles, 30, 1, 1000),
+      forbiddenPaths: cleanStringList(submit.forbiddenPaths, 50, 300)
+    },
+    writeback: {
+      comment: booleanOr(writeback.comment, true),
+      statusOnSuccess: cleanText(writeback.statusOnSuccess, 100),
+      statusOnFailure: cleanText(writeback.statusOnFailure, 100),
+      statusOnConfirm: cleanText(writeback.statusOnConfirm, 100),
+      assigneeOnFailure: cleanText(writeback.assigneeOnFailure, 128)
+    },
+    concurrency: clampInteger(source.concurrency, 1, 1, 5),
+    lastScanAt: cleanText(source.lastScanAt, 40),
+    createdAt: cleanText(source.createdAt, 40),
+    updatedAt: cleanText(source.updatedAt, 40)
+  };
+}
+
+function normalizePolicies(value) {
+  if (!Array.isArray(value)) return [];
+  const byId = new Map();
+  for (const item of value) {
+    const policy = normalizePolicy(item);
+    if (policy && !byId.has(policy.id)) byId.set(policy.id, policy);
+    if (byId.size >= POLICY_LIMIT) break;
+  }
+  return [...byId.values()].sort((left, right) => left.order - right.order);
+}
+
+function normalizeRunResult(value) {
+  const source = value && typeof value === "object" ? value : {};
+  const outcome = cleanText(source.outcome, 30);
+  return {
+    outcome: REPORT_OUTCOMES.has(outcome) ? outcome : "",
+    summary: cleanTextPreserve(source.summary, 4000).trim(),
+    rootCause: cleanTextPreserve(source.rootCause, 4000).trim(),
+    plan: cleanTextPreserve(source.plan, 4000).trim(),
+    risk: cleanTextPreserve(source.risk, 2000).trim(),
+    branch: cleanText(source.branch, 255),
+    commits: cleanStringList(source.commits, 20, 80),
+    changedFiles: cleanStringList(source.changedFiles, 200, 500),
+    mrUrl: cleanText(source.mrUrl, 2000),
+    mrId: cleanText(source.mrId, 64),
+    pipelineRunId: cleanText(source.pipelineRunId, 128),
+    verify: (Array.isArray(source.verify) ? source.verify : []).slice(0, 20).map((entry) => ({
+      command: cleanText(entry?.command, 500),
+      ok: Boolean(entry?.ok),
+      output: cleanTextPreserve(entry?.output, 2000).trim()
+    })).filter((entry) => entry.command)
+  };
+}
+
+function normalizeRun(value) {
+  const source = value && typeof value === "object" ? value : {};
+  const id = cleanText(source.id, 64);
+  if (!id) return null;
+  const status = cleanText(source.status, 30);
+  return {
+    id,
+    policyId: cleanText(source.policyId, 64),
+    policyName: cleanText(source.policyName, 200),
+    accountId: cleanText(source.accountId, 100),
+    projectId: cleanText(source.projectId, 128),
+    workspaceId: cleanText(source.workspaceId, 100),
+    defectId: cleanText(source.defectId, 128),
+    serial: cleanText(source.serial, 128),
+    subject: cleanText(source.subject, 1000),
+    mode: POLICY_MODES.has(cleanText(source.mode, 30)) ? cleanText(source.mode, 30) : "analyze-confirm",
+    // 宿主重启后仍在进行中的运行无法恢复，读档时标记为“已中断”。
+    status: RUN_STATUSES.has(status) ? (RUN_ACTIVE_STATUSES.has(status) ? "interrupted" : status) : "failed",
+    sessionId: cleanText(source.sessionId, 128),
+    fingerprint: cleanText(source.fingerprint, 200),
+    trigger: cleanText(source.trigger, 60) || "scan",
+    steps: (Array.isArray(source.steps) ? source.steps : []).slice(0, RUN_STEP_LIMIT).map((step) => ({
+      name: cleanText(step?.name, 40),
+      status: cleanText(step?.status, 20),
+      at: cleanText(step?.at, 40),
+      detail: cleanTextPreserve(step?.detail, 2000).trim()
+    })).filter((step) => step.name),
+    log: (Array.isArray(source.log) ? source.log : []).slice(-RUN_LOG_LIMIT).map((entry) => ({
+      t: cleanText(entry?.t, 40),
+      m: cleanTextPreserve(entry?.m, 2000).trim(),
+      c: cleanText(entry?.c, 20)
+    })),
+    result: normalizeRunResult(source.result),
+    error: cleanTextPreserve(source.error, 2000).trim(),
+    startedAt: cleanText(source.startedAt, 40),
+    endedAt: cleanText(source.endedAt, 40),
+    durationMs: clampInteger(source.durationMs, 0, 0, 2_147_483_647)
+  };
+}
+
+function normalizeRuns(value) {
+  if (!Array.isArray(value)) return [];
+  const byId = new Map();
+  for (const item of value) {
+    const run = normalizeRun(item);
+    if (run && !byId.has(run.id)) byId.set(run.id, run);
+    if (byId.size >= RUN_LIMIT) break;
+  }
+  return [...byId.values()];
+}
+
+function normalizeRunsSeen(value) {
+  const source = value && typeof value === "object" && !Array.isArray(value) ? value : {};
+  const result = {};
+  for (const [key, item] of Object.entries(source).slice(0, 5000)) {
+    const defectId = cleanText(key, 128);
+    if (!defectId || !item || typeof item !== "object") continue;
+    result[defectId] = {
+      runId: cleanText(item.runId, 64),
+      policyId: cleanText(item.policyId, 64),
+      at: cleanText(item.at, 40),
+      fingerprint: cleanText(item.fingerprint, 200),
+      outcome: cleanText(item.outcome, 30)
+    };
+  }
+  return result;
+}
+
 function normalizeState(value) {
   if (!value || typeof value !== "object") return emptyState();
   return {
@@ -100,7 +418,11 @@ function normalizeState(value) {
     selectedAccountId: cleanText(value.selectedAccountId, 100),
     accounts: Array.isArray(value.accounts) ? value.accounts.filter((item) => item && typeof item === "object") : [],
     cache: value.cache && typeof value.cache === "object" ? value.cache : {},
-    system: normalizeSystemInfo(value.system)
+    system: normalizeSystemInfo(value.system),
+    flows: normalizeFlows(value.flows),
+    policies: normalizePolicies(value.policies),
+    runs: normalizeRuns(value.runs),
+    runsSeen: normalizeRunsSeen(value.runsSeen)
   };
 }
 
@@ -318,6 +640,188 @@ function createJsonStore(fileName, cacheMaxItems) {
     });
   }
 
+  async function listFlows() {
+    const state = await load();
+    return state.flows;
+  }
+
+  async function saveFlow(input) {
+    return update((state) => {
+      const now = new Date().toISOString();
+      const source = input && typeof input === "object" ? input : {};
+      const id = cleanText(source.id, 64);
+      const existing = id ? state.flows.find((item) => item.id === id) : null;
+      const flow = normalizeFlow({
+        ...source,
+        id: existing ? existing.id : id || randomUUID(),
+        createdAt: existing ? existing.createdAt : now,
+        updatedAt: now
+      });
+      if (!flow) throw new YunxiaoError("编排名称不能为空", 422);
+      const index = state.flows.findIndex((item) => item.id === flow.id);
+      if (index >= 0) state.flows[index] = flow;
+      else state.flows.unshift(flow);
+      return flow;
+    });
+  }
+
+  async function deleteFlow(flowId) {
+    return update((state) => {
+      const id = cleanText(flowId, 64);
+      const index = state.flows.findIndex((item) => item.id === id);
+      if (index < 0) throw new YunxiaoError("编排不存在", 404);
+      state.flows.splice(index, 1);
+      return { ok: true };
+    });
+  }
+
+  async function saveFlowRun(flowId, runInput) {
+    return update((state) => {
+      const id = cleanText(flowId, 64);
+      const flow = state.flows.find((item) => item.id === id);
+      if (!flow) throw new YunxiaoError("编排不存在", 404);
+      const run = normalizeFlowRun(runInput);
+      const index = flow.runs.findIndex((item) => item.id === run.id);
+      if (index >= 0) flow.runs[index] = run;
+      else flow.runs.unshift(run);
+      flow.runs = flow.runs.slice(0, FLOW_RUNS_LIMIT);
+      flow.updatedAt = new Date().toISOString();
+      return run;
+    });
+  }
+
+  // —— 处理规则与运行台账 ——————————————————————————————————————————————
+  async function listPolicies() {
+    const state = await load();
+    return state.policies;
+  }
+
+  async function savePolicy(input) {
+    return update((state) => {
+      const now = new Date().toISOString();
+      const source = input && typeof input === "object" ? input : {};
+      const id = cleanText(source.id, 64);
+      const existing = id ? state.policies.find((item) => item.id === id) : null;
+      if (!existing && state.policies.length >= POLICY_LIMIT) throw new YunxiaoError(`规则数量已达上限 ${POLICY_LIMIT}`, 422);
+      const policy = normalizePolicy({
+        ...source,
+        id: existing ? existing.id : id || randomUUID(),
+        order: source.order === undefined ? (existing ? existing.order : state.policies.length) : source.order,
+        lastScanAt: existing ? existing.lastScanAt : "",
+        createdAt: existing ? existing.createdAt : now,
+        updatedAt: now
+      });
+      if (!policy) throw new YunxiaoError("规则名称不能为空", 422);
+      // 触发范围变化后重新快照存量，避免把旧快照之外的历史缺陷当成新增。
+      if (existing && JSON.stringify(existing.trigger) !== JSON.stringify(policy.trigger)) policy.lastScanAt = "";
+      const index = state.policies.findIndex((item) => item.id === policy.id);
+      if (index >= 0) state.policies[index] = policy;
+      else state.policies.push(policy);
+      state.policies.sort((left, right) => left.order - right.order);
+      return policy;
+    });
+  }
+
+  async function deletePolicy(policyId) {
+    return update((state) => {
+      const id = cleanText(policyId, 64);
+      const index = state.policies.findIndex((item) => item.id === id);
+      if (index < 0) throw new YunxiaoError("规则不存在", 404);
+      state.policies.splice(index, 1);
+      state.policies.forEach((item, position) => { item.order = position; });
+      return { ok: true };
+    });
+  }
+
+  async function reorderPolicies(ids) {
+    return update((state) => {
+      const wanted = cleanStringList(ids, POLICY_LIMIT, 64);
+      const byId = new Map(state.policies.map((item) => [item.id, item]));
+      const ordered = wanted.map((id) => byId.get(id)).filter(Boolean);
+      for (const item of state.policies) if (!ordered.includes(item)) ordered.push(item);
+      ordered.forEach((item, position) => { item.order = position; });
+      state.policies = ordered;
+      return state.policies;
+    });
+  }
+
+  async function markPolicyScanned(policyId, at) {
+    return update((state) => {
+      const policy = state.policies.find((item) => item.id === cleanText(policyId, 64));
+      if (policy) policy.lastScanAt = cleanText(at, 40) || new Date().toISOString();
+      return policy || null;
+    });
+  }
+
+  async function listRuns() {
+    const state = await load();
+    return state.runs;
+  }
+
+  async function getRun(runId) {
+    const state = await load();
+    return state.runs.find((item) => item.id === cleanText(runId, 64)) || null;
+  }
+
+  // 引擎每次状态变化都整条覆盖写入；台账按开始时间倒序、全局最多 RUN_LIMIT 条。
+  async function saveRun(input) {
+    return update((state) => {
+      const run = normalizeRun(input);
+      if (!run) throw new YunxiaoError("运行记录缺少 ID", 422);
+      // normalizeRun 把进行中的状态改写为 interrupted 是为读档设计的；引擎写入时保留原状态。
+      const liveStatus = cleanText(input?.status, 30);
+      if (RUN_STATUSES.has(liveStatus)) run.status = liveStatus;
+      const index = state.runs.findIndex((item) => item.id === run.id);
+      if (index >= 0) state.runs[index] = run;
+      else state.runs.unshift(run);
+      // 超限时从最旧的已结束记录开始淘汰，进行中的保留。
+      while (state.runs.length > RUN_LIMIT) {
+        let removed = false;
+        for (let position = state.runs.length - 1; position >= 0; position -= 1) {
+          if (RUN_ACTIVE_STATUSES.has(state.runs[position].status)) continue;
+          state.runs.splice(position, 1);
+          removed = true;
+          break;
+        }
+        if (!removed) break;
+      }
+      return run;
+    });
+  }
+
+  async function markSeen(defectId, info) {
+    return update((state) => {
+      const id = cleanText(defectId, 128);
+      if (!id) return null;
+      state.runsSeen[id] = {
+        runId: cleanText(info?.runId, 64),
+        policyId: cleanText(info?.policyId, 64),
+        at: cleanText(info?.at, 40) || new Date().toISOString(),
+        fingerprint: cleanText(info?.fingerprint, 200),
+        outcome: cleanText(info?.outcome, 30)
+      };
+      return state.runsSeen[id];
+    });
+  }
+
+  async function markSeenBatch(entries) {
+    return update((state) => {
+      const now = new Date().toISOString();
+      for (const entry of entries || []) {
+        const id = cleanText(entry?.defectId, 128);
+        if (!id || state.runsSeen[id]) continue;
+        state.runsSeen[id] = {
+          runId: "",
+          policyId: cleanText(entry?.policyId, 64),
+          at: now,
+          fingerprint: cleanText(entry?.fingerprint, 200),
+          outcome: "snapshot"
+        };
+      }
+      return Object.keys(state.runsSeen).length;
+    });
+  }
+
   return {
     absolutePath,
     load,
@@ -333,7 +837,21 @@ function createJsonStore(fileName, cacheMaxItems) {
     putCache,
     getCache,
     getSystemInfo,
-    saveSystemInfo
+    saveSystemInfo,
+    listFlows,
+    saveFlow,
+    deleteFlow,
+    saveFlowRun,
+    listPolicies,
+    savePolicy,
+    deletePolicy,
+    reorderPolicies,
+    markPolicyScanned,
+    listRuns,
+    getRun,
+    saveRun,
+    markSeen,
+    markSeenBatch
   };
 }
 
@@ -385,7 +903,9 @@ function createApiClient(config) {
       workitems: `${root}/workitems`,
       workitemSearch: `${root}/workitems:search`,
       pipelines: `/oapi/v1/flow/organizations/${org}/pipelines`,
-      codeup: `/oapi/v1/codeup/organizations/${org}`
+      codeup: `/oapi/v1/codeup/organizations/${org}`,
+      testhub: `/oapi/v1/testhub/organizations/${org}`,
+      packages: `/oapi/v1/packages/organizations/${org}`
     };
   }
 
@@ -758,11 +1278,44 @@ function createApiClient(config) {
     };
   }
 
+  // 分页读取一个 Codeup 仓库的全部分支；403 时区分“令牌无 Codeup API 权限”与
+  // “令牌用户不在代码库成员里”，两者在界面上给出不同的修复提示。
+  async function listRepositoryBranches(account, repositoryPath) {
+    const api = paths(account);
+    const result = { branches: [], warning: "" };
+    let codeupApiAuthorized;
+    for (let page = 1; page <= 100; page += 1) {
+      const response = await requestOptional(
+        account,
+        `${api.codeup}/repositories/${encodeURIComponent(repositoryPath)}/branches`,
+        { query: { page, perPage: 100, sort: "updated_desc" } }
+      );
+      if (!response.ok || !Array.isArray(response.payload)) {
+        if (response.error?.status === 403) {
+          if (codeupApiAuthorized === undefined) {
+            const probe = await requestOptional(account, `${api.codeup}/repositories`, { query: { page: 1, perPage: 1 } });
+            codeupApiAuthorized = probe.ok && Array.isArray(probe.payload);
+          }
+          result.warning = codeupApiAuthorized
+            ? "令牌的代码管理 API 权限已生效，但令牌所属用户无此代码库访问权限；请将该用户加入代码库成员"
+            : "当前令牌没有 Codeup 分支读取权限；请检查“代码管理 → 分支 → 只读”权限";
+        } else result.warning = "分支读取失败，可稍后重试";
+        break;
+      }
+      const pageBranches = response.payload.map((item) => cleanText(item?.name, 500)).filter(Boolean);
+      result.branches.push(...pageBranches);
+      const pages = Number(response.headers.get("x-total-pages") || 0);
+      if ((pages && page >= pages) || (!pages && pageBranches.length < 100)) break;
+      if (page === 100) result.warning = "分支超过读取上限，仅展示前 10000 条";
+    }
+    result.branches = [...new Set(result.branches)];
+    return result;
+  }
+
   async function listPipelineBranches(account, pipelineId) {
     const api = paths(account);
     const detail = await getPipeline(account, pipelineId);
     const results = [];
-    let codeupApiAuthorized;
     for (const source of detail.sources) {
       const result = { ...source, branches: [], warning: "" };
       const repositoryPath = codeupRepositoryPath(source.repo);
@@ -774,31 +1327,9 @@ function createApiClient(config) {
         results.push(result);
         continue;
       }
-      for (let page = 1; page <= 100; page += 1) {
-        const response = await requestOptional(
-          account,
-          `${api.codeup}/repositories/${encodeURIComponent(repositoryPath)}/branches`,
-          { query: { page, perPage: 100, sort: "updated_desc" } }
-        );
-        if (!response.ok || !Array.isArray(response.payload)) {
-          if (response.error?.status === 403) {
-            if (codeupApiAuthorized === undefined) {
-              const probe = await requestOptional(account, `${api.codeup}/repositories`, { query: { page: 1, perPage: 1 } });
-              codeupApiAuthorized = probe.ok && Array.isArray(probe.payload);
-            }
-            result.warning = codeupApiAuthorized
-              ? "令牌的代码管理 API 权限已生效，但令牌所属用户无此代码库访问权限；请将该用户加入代码库成员"
-              : "当前令牌没有 Codeup 分支读取权限；请检查“代码管理 → 分支 → 只读”权限";
-          } else result.warning = "分支读取失败，可稍后重试";
-          break;
-        }
-        const pageBranches = response.payload.map((item) => cleanText(item?.name, 500)).filter(Boolean);
-        result.branches.push(...pageBranches);
-        const pages = Number(response.headers.get("x-total-pages") || 0);
-        if ((pages && page >= pages) || (!pages && pageBranches.length < 100)) break;
-        if (page === 100) result.warning = "分支超过读取上限，仅展示前 10000 条";
-      }
-      result.branches = [...new Set(result.branches)];
+      const read = await listRepositoryBranches(account, repositoryPath);
+      result.branches = read.branches;
+      result.warning = read.warning;
       results.push(result);
     }
     return results;
@@ -859,6 +1390,190 @@ function createApiClient(config) {
     return { pipelineId, pipelineRunId: id };
   }
 
+  // —— 代码 Codeup：仓库 / 合并请求 ——————————————————————————————————————
+  // Codeup 组织级 API 对仓库使用 pathWithNamespace 形式的编码路径（org/repo），
+  // 与分支读取一致；字段命名在不同版本里存在 camelCase / snake_case 差异，读取时两者兼容。
+  async function listCodeupRepositories(account, query = {}) {
+    const api = paths(account);
+    const page = clampInteger(query.page, 1, 1, 10_000);
+    const pageSize = clampInteger(query.pageSize, 20, 1, 100);
+    const response = await request(account, `${api.codeup}/repositories`, {
+      query: { page, perPage: pageSize, search: cleanText(query.search, 255) }
+    });
+    if (!Array.isArray(response.payload)) throw new YunxiaoError("云效代码库列表接口返回格式异常");
+    const items = response.payload
+      .filter((item) => item && typeof item === "object")
+      .map((item) => ({
+        id: cleanText(item.id, 64),
+        path: cleanText(item.pathWithNamespace || item.path, 500),
+        name: cleanText(item.name || item.path, 500),
+        description: cleanText(item.description, 500),
+        defaultBranch: cleanText(item.default_branch || item.defaultBranch, 500),
+        visibility: cleanText(item.visibility_level || item.visibility, 60),
+        lastActivityAt: item.last_activity_at || item.lastActivityAt || item.updatedAt || null
+      }))
+      .filter((item) => item.id && item.path);
+    return { items, total: totalFrom(response.headers, page, pageSize, items.length), page, pageSize };
+  }
+
+  async function listCodeupMergeRequests(account, repositoryPath, query = {}) {
+    const api = paths(account);
+    const page = clampInteger(query.page, 1, 1, 10_000);
+    const pageSize = clampInteger(query.pageSize, 20, 1, 100);
+    const state = cleanText(query.state, 20) || "opened";
+    const response = await request(account, `${api.codeup}/repositories/${encodeURIComponent(repositoryPath)}/merge_requests`, {
+      query: { state, page, perPage: pageSize }
+    });
+    if (!Array.isArray(response.payload)) throw new YunxiaoError("云效合并请求接口返回格式异常");
+    const pick = (item, ...keys) => {
+      for (const key of keys) {
+        const value = item?.[key];
+        if (value !== undefined && value !== null && value !== "") return value;
+      }
+      return null;
+    };
+    const items = response.payload
+      .filter((item) => item && typeof item === "object")
+      .map((item) => ({
+        id: cleanText(pick(item, "id", "iid", "mergeRequestId"), 64),
+        title: cleanText(pick(item, "title", "name"), 1000),
+        state: cleanText(pick(item, "state", "status"), 40),
+        sourceBranch: cleanText(pick(item, "source_branch", "sourceBranch", "sourceBranchName"), 500),
+        targetBranch: cleanText(pick(item, "target_branch", "targetBranch", "targetBranchName"), 500),
+        authorName: cleanText(pick(item, "author_name", "authorName") || displayName(pick(item, "author", "creator")), 255),
+        createdAt: pick(item, "created_at", "createdAt", "gmtCreate"),
+        updatedAt: pick(item, "updated_at", "updatedAt", "gmtModified")
+      }))
+      .filter((item) => item.id);
+    return { items, total: totalFrom(response.headers, page, pageSize, items.length), page, pageSize, state };
+  }
+
+  // 合并属于写操作：接口不存在或无权限时直接报错，由界面提示改走云效页面。
+  async function mergeCodeupMergeRequest(account, repositoryPath, mergeRequestId) {
+    const api = paths(account);
+    if (!cleanText(repositoryPath, 500) || !cleanText(mergeRequestId, 64)) {
+      throw new YunxiaoError("仓库与合并请求 ID 不能为空", 422);
+    }
+    await request(
+      account,
+      `${api.codeup}/repositories/${encodeURIComponent(repositoryPath)}/merge_requests/${encodeURIComponent(mergeRequestId)}/merge`,
+      { method: "POST", body: {} }
+    );
+    return { ok: true };
+  }
+
+  // 创建合并请求（CreateChangeRequest）：源库与目标库同为本仓库，仓库需使用数字 ID；
+  // workItemIds 把 MR 关联到触发它的缺陷。
+  async function createChangeRequest(account, repositoryId, input = {}) {
+    const api = paths(account);
+    const repoId = cleanText(repositoryId, 64);
+    const sourceBranch = cleanText(input.sourceBranch, 255);
+    const targetBranch = cleanText(input.targetBranch, 255);
+    const title = cleanText(input.title, 256);
+    if (!repoId || !sourceBranch || !targetBranch || !title) {
+      throw new YunxiaoError("创建合并请求需要仓库 ID、源分支、目标分支与标题", 422);
+    }
+    if (!/^\d+$/.test(repoId)) throw new YunxiaoError("创建合并请求需要 Codeup 仓库的数字 ID", 422);
+    const body = {
+      sourceBranch,
+      targetBranch,
+      title,
+      description: cleanTextPreserve(input.description, 10_000),
+      sourceProjectId: Number(repoId),
+      targetProjectId: Number(repoId)
+    };
+    const workItemIds = cleanStringList(input.workItemIds, 20, 128);
+    if (workItemIds.length) body.workItemIds = workItemIds.join(",");
+    const response = await request(account, `${api.codeup}/repositories/${encodeURIComponent(repoId)}/changeRequests`, {
+      method: "POST",
+      body
+    });
+    const payload = response.payload && typeof response.payload === "object" ? response.payload : {};
+    return {
+      localId: cleanText(payload.localId ?? payload.iid ?? payload.id, 64),
+      url: cleanTextPreserve(payload.detailUrl || payload.webUrl || payload.web_url, 4000),
+      status: cleanText(payload.status || payload.state, 40),
+      sourceBranch,
+      targetBranch,
+      title
+    };
+  }
+
+  // —— 测试管理 / 制品仓库 ————————————————————————————————————————————————
+  // 测试计划列表使用官方 projex 域接口（POST testPlan/list）；
+  // testhub 域下没有 testplans 端点（会 404），列表接口也不返回用例统计，
+  // 用例通过率需按计划再调 GetTestResultList，这里先展示计划基本信息。
+  async function listTestPlans(account, query = {}) {
+    const api = paths(account);
+    const page = clampInteger(query.page, 1, 1, 10_000);
+    const pageSize = clampInteger(query.pageSize, 20, 1, 100);
+    const response = await request(account, `${api.projex}/testPlan/list`, {
+      method: "POST",
+      query: { page, perPage: pageSize },
+      body: {}
+    });
+    const payload = Array.isArray(response.payload)
+      ? response.payload
+      : Array.isArray(response.payload?.items || response.payload?.list) ? response.payload.items || response.payload.list : null;
+    if (!Array.isArray(payload)) throw new YunxiaoError("云效测试计划接口返回格式异常");
+    const pick = (item, ...keys) => {
+      for (const key of keys) {
+        const value = item?.[key];
+        if (value !== undefined && value !== null && value !== "") return value;
+      }
+      return null;
+    };
+    const items = payload
+      .filter((item) => item && typeof item === "object")
+      .map((item) => ({
+        id: cleanText(pick(item, "testPlanIdentifier", "id", "testplanId", "planId"), 64),
+        name: cleanText(pick(item, "name", "title", "subject"), 500) || "未命名测试计划",
+        status: cleanText(pick(item, "status", "statusName", "state"), 60),
+        caseTotal: clampInteger(pick(item, "caseTotal", "total", "caseCount"), 0, 0, 1_000_000),
+        casePassed: clampInteger(pick(item, "casePassed", "passed", "passCount"), 0, 0, 1_000_000),
+        caseFailed: clampInteger(pick(item, "caseFailed", "failed", "failCount"), 0, 0, 1_000_000),
+        ownerName: Array.isArray(item?.managers) && item.managers.length
+          ? cleanText(String(item.managers[0]), 255)
+          : cleanText(pick(item, "ownerName", "owner", "creatorName"), 255),
+        gmtModified: pick(item, "gmtCreate", "gmtModified", "updatedAt", "modifiedAt"),
+        spaceIdentifier: cleanText(pick(item, "spaceIdentifier"), 64),
+        sprintIdentifier: cleanText(pick(item, "sprintIdentifier"), 64),
+        startDate: pick(item, "startDate"),
+        endDate: pick(item, "endDate")
+      }))
+      .filter((item) => item.id);
+    return { items, total: totalFrom(response.headers, page, pageSize, items.length), page, pageSize };
+  }
+
+  async function listPackageRepositories(account, query = {}) {
+    const api = paths(account);
+    const page = clampInteger(query.page, 1, 1, 10_000);
+    const pageSize = clampInteger(query.pageSize, 20, 1, 100);
+    const response = await request(account, `${api.packages}/repositories`, { query: { page, perPage: pageSize } });
+    const payload = Array.isArray(response.payload)
+      ? response.payload
+      : Array.isArray(response.payload?.items || response.payload?.list) ? response.payload.items || response.payload.list : null;
+    if (!Array.isArray(payload)) throw new YunxiaoError("云效制品仓库接口返回格式异常");
+    const pick = (item, ...keys) => {
+      for (const key of keys) {
+        const value = item?.[key];
+        if (value !== undefined && value !== null && value !== "") return value;
+      }
+      return null;
+    };
+    const items = payload
+      .filter((item) => item && typeof item === "object")
+      .map((item) => ({
+        id: cleanText(pick(item, "id", "repositoryId", "repoId"), 64),
+        name: cleanText(pick(item, "name", "repositoryName", "repoName"), 500),
+        type: cleanText(pick(item, "type", "repositoryType", "packageType"), 100),
+        description: cleanText(pick(item, "description", "remark"), 500),
+        createdAt: pick(item, "createdAt", "gmtCreate", "created_at")
+      }))
+      .filter((item) => item.id && item.name);
+    return { items, total: totalFrom(response.headers, page, pageSize, items.length), page, pageSize };
+  }
+
   return {
     listProjects,
     listDefects,
@@ -878,7 +1593,14 @@ function createApiClient(config) {
     listPipelineRuns,
     getPipelineRun,
     getPipelineJobLog,
-    createPipelineRun
+    createPipelineRun,
+    listCodeupRepositories,
+    listRepositoryBranches,
+    listCodeupMergeRequests,
+    mergeCodeupMergeRequest,
+    createChangeRequest,
+    listTestPlans,
+    listPackageRepositories
   };
 }
 
@@ -1565,6 +2287,45 @@ function createRpc(store, api, systemNotifier = showSystemNotification, listWork
         const { account } = await accountAndProject(args);
         return api.createPipelineRun(account, cleanText(args.pipelineId, 128), args);
       }
+      case "code.repos.list": {
+        const { account } = await accountAndProject(args);
+        return cached(account.id, "codeup-repos", () => api.listCodeupRepositories(account, args));
+      }
+      case "code.branches.list": {
+        const { account } = await accountAndProject(args);
+        const repositoryPath = cleanText(args.repositoryId, 500);
+        if (!repositoryPath) throw new YunxiaoError("仓库 ID 不能为空", 422);
+        const result = await api.listRepositoryBranches(account, repositoryPath);
+        return { items: result.branches, warning: result.warning };
+      }
+      case "code.mrs.list": {
+        const { account } = await accountAndProject(args);
+        const repositoryPath = cleanText(args.repositoryId, 500);
+        if (!repositoryPath) throw new YunxiaoError("仓库 ID 不能为空", 422);
+        return cached(account.id, `codeup-mrs:${repositoryPath}`, () => api.listCodeupMergeRequests(account, repositoryPath, args));
+      }
+      case "code.mr.merge": {
+        const { account } = await accountAndProject(args);
+        const repositoryPath = cleanText(args.repositoryId, 500);
+        const mergeRequestId = cleanText(args.mergeRequestId, 64);
+        return api.mergeCodeupMergeRequest(account, repositoryPath, mergeRequestId);
+      }
+      case "tests.plans.list": {
+        const { account } = await accountAndProject(args);
+        return cached(account.id, "test-plans", () => api.listTestPlans(account, args));
+      }
+      case "packages.repos.list": {
+        const { account } = await accountAndProject(args);
+        return cached(account.id, "package-repos", () => api.listPackageRepositories(account, args));
+      }
+      case "flows.list":
+        return { items: await store.listFlows() };
+      case "flows.save":
+        return store.saveFlow(args.flow);
+      case "flows.delete":
+        return store.deleteFlow(args.flowId);
+      case "flows.run.save":
+        return store.saveFlowRun(cleanText(args.flowId, 64), args.run);
       default:
         throw new YunxiaoError(`未知操作：${cleanText(method, 100)}`, 404);
     }
@@ -1691,6 +2452,8 @@ export {
   mapDefect,
   mapPipeline,
   mapPipelineRun,
+  normalizeFlow,
+  normalizeFlows,
   isNotifiableDefectStatus,
   normalizeDefectNotification,
   normalizeSystemInfo,

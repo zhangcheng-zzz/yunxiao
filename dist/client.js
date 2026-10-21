@@ -8,12 +8,156 @@ try { ReactRuntime = require("react"); } catch (error) {}
 var STYLE_ID = "dsh-yunxiao-style";
 var ROOT_ID = "dsh-yunxiao-root";
 var PAGE_SIZE = 5;
+// 概览页每个聚合卡最多展示的条数（方格网格两行左右），完整列表到对应页签查看。
+var DASHBOARD_PREVIEW_LIMIT = 8;
 var PANEL_WIDTH_STORAGE_KEY = "dsh-yunxiao:panel-width";
+var FULL_MODE_STORAGE_KEY = "dsh-yunxiao:full-mode";
 var DEFAULT_PANEL_WIDTH = 480;
 var MIN_PANEL_WIDTH = 380;
 var MAX_PANEL_WIDTH = 1080;
+// 全页模式：内容区占满除聊天列以外的宽度；340px 为聊天区保留宽度。
+var FULL_MODE_RESERVE = 16;
+// 宿主左侧导航轨的实测宽度；widenWorkspaceFrame 打开面板时从宿主网格读取后更新。
+var HOST_SIDEBAR_TRACK = 280;
 var DEFAULT_NOTIFICATION_INTERVAL = 5;
 var NOTIFICATION_MINUTE_MS = Math.max(100, Number(window.__DYX_NOTIFICATION_MINUTE_MS__) || 60 * 1000);
+// 全页模式开关：默认全页铺满（覆盖中间聊天区）；手动切回侧栏后记住选择（存 "0"）。
+var FULL_MODE_ACTIVE = true;
+
+// —— 编排节点类型注册表（客户端画布与运行引擎共用） ————————————————
+// act-agent / act-item / ntf-* 调用真实能力（DSH 会话、工作项更新、系统通知、评论）；
+// act-pipe 调真实流水线运行；act-mr / act-scan / act-test / act-deploy 作为人工检查点
+// （云效对应的写接口能力因组织而异，先以“等待人工确认”推进，避免误操作）。
+var FLOW_NODE_TYPES = {
+  "trg-item": { glyph: "⚡", color: "#a56207", group: "触发器", name: "工作项事件", checkpoint: false,
+    fields: [{ k: "tp", l: "类型", o: ["缺陷", "需求", "任务"] }, { k: "ev", l: "事件", o: ["待确认 / 再次打开", "任意状态变更"] }],
+    sub: function (n) { return (n.cfg.tp || "缺陷") + " · " + (n.cfg.ev || ""); } },
+  "trg-pipe": { glyph: "⇄", color: "#a56207", group: "触发器", name: "流水线事件", checkpoint: false,
+    fields: [{ k: "pipe", l: "流水线", o: [] }, { k: "ev", l: "事件", o: ["失败", "成功"] }],
+    sub: function (n) { return (n.cfg.pipe || "") + " · " + (n.cfg.ev || ""); } },
+  "trg-cron": { glyph: "⏱", color: "#a56207", group: "触发器", name: "定时触发", checkpoint: false,
+    fields: [{ k: "d", l: "频率", o: ["每小时", "每天 02:00", "工作日 10:00"] }],
+    sub: function (n) { return n.cfg.d || ""; } },
+  "op-cond": { glyph: "⑂", color: "#68758c", group: "控制", name: "条件分支", checkpoint: false,
+    fields: [{ k: "f", l: "条件字段", o: ["优先级", "根因定位"] }, { k: "op", l: "比较", o: ["≤", "="] }, { k: "v", l: "值", o: ["P1", "P2", "成功"] }],
+    sub: function (n) { return (n.cfg.f || "") + " " + (n.cfg.op || "") + " " + (n.cfg.v || ""); } },
+  "op-delay": { glyph: "⏳", color: "#68758c", group: "控制", name: "延时等待", checkpoint: false,
+    fields: [{ k: "d", l: "时长", o: ["1 分钟", "5 分钟", "30 分钟"] }],
+    sub: function (n) { return "等待 " + (n.cfg.d || ""); } },
+  "act-agent": { glyph: "🤖", color: "#7048d8", group: "DSH 智能体", name: "DSH 智能处理", checkpoint: false,
+    fields: [{ k: "task", l: "任务", o: ["缺陷修复", "日志诊断", "任务拆解"] }, { k: "mode", l: "方式", o: ["直接发送", "生成草稿"] }],
+    sub: function (n) { return (n.cfg.task || "") + " · " + (n.cfg.mode || "直接发送"); } },
+  "act-item": { glyph: "✔", color: "#3565e0", group: "云效动作", name: "更新工作项", checkpoint: false,
+    fields: [{ k: "st", l: "目标状态名", o: [] }, { k: "cmt", l: "评论回写", o: ["开", "关"] }],
+    sub: function (n) { return "状态 → " + (n.cfg.st || "") + (n.cfg.cmt === "开" ? " · 评论回写" : ""); } },
+  "act-mr": { glyph: "⎇", color: "#3565e0", group: "云效动作", name: "创建合并请求", checkpoint: true,
+    fields: [{ k: "note", l: "检查点说明", o: [] }],
+    sub: function (n) { return n.cfg.note || "人工确认 MR 已创建"; } },
+  "act-pipe": { glyph: "▶", color: "#3565e0", group: "云效动作", name: "运行流水线", checkpoint: false,
+    fields: [{ k: "pipe", l: "流水线", o: [] }, { k: "br", l: "分支", o: ["自动", "develop", "master"] }],
+    sub: function (n) { return (n.cfg.pipe || "默认流水线") + " · " + (n.cfg.br || "自动") + " 分支"; } },
+  "act-scan": { glyph: "🛡", color: "#3565e0", group: "云效动作", name: "代码检测卡点", checkpoint: true,
+    fields: [{ k: "gate", l: "卡点", o: ["0 个严重问题", "无阻塞"] }],
+    sub: function (n) { return "卡点：" + (n.cfg.gate || "0 个严重问题"); } },
+  "act-test": { glyph: "⚗", color: "#3565e0", group: "云效动作", name: "执行测试计划", checkpoint: true,
+    fields: [{ k: "plan", l: "测试计划", o: [] }, { k: "gate", l: "通过率卡点", o: ["90%", "70%", "100%"] }],
+    sub: function (n) { return (n.cfg.plan || "测试计划") + " · " + (n.cfg.gate || "90%"); } },
+  "act-deploy": { glyph: "🚀", color: "#3565e0", group: "云效动作", name: "部署检查点", checkpoint: true,
+    fields: [{ k: "env", l: "环境", o: ["日常", "预发", "生产"] }],
+    sub: function (n) { return "环境：" + (n.cfg.env || "日常"); } },
+  "ntf-msg": { glyph: "🔔", color: "#17754c", group: "通知", name: "系统通知", checkpoint: false,
+    fields: [{ k: "tpl", l: "内容模板", o: ["验收提醒", "人工处理提醒", "任务提醒"] }],
+    sub: function (n) { return n.cfg.tpl || "验收提醒"; } },
+  "ntf-comment": { glyph: "💬", color: "#17754c", group: "通知", name: "评论回写", checkpoint: false,
+    fields: [{ k: "tpl", l: "内容模板", o: ["处理摘要", "诊断结论"] }],
+    sub: function (n) { return "回写：" + (n.cfg.tpl || "处理摘要"); } }
+};
+var FLOW_DEFAULT_TEMPLATES = [
+  { name: "缺陷自动修复流", on: false, autoRun: true, trg: "缺陷单流转", nodes: [
+    { id: "n1", tp: "trg-item", name: "缺陷状态变更", x: 8, y: 20, cfg: { tp: "缺陷", ev: "待确认 / 再次打开" } },
+    { id: "n2", tp: "op-cond", name: "优先级 ≤ P1？", x: 196, y: 20, cfg: { f: "优先级", op: "≤", v: "P1" } },
+    { id: "n3", tp: "act-agent", name: "DSH 自动处理", x: 384, y: 20, cfg: { task: "缺陷修复", mode: "直接发送" } },
+    { id: "n4", tp: "act-mr", name: "创建合并请求", x: 384, y: 168, cfg: { note: "在 Codeup 从修复分支发起 MR" } },
+    { id: "n5", tp: "act-scan", name: "代码检测卡点", x: 196, y: 168, cfg: { gate: "0 个严重问题" } },
+    { id: "n6", tp: "act-pipe", name: "运行流水线", x: 8, y: 168, cfg: { pipe: "", br: "自动" } },
+    { id: "n7", tp: "act-test", name: "执行测试计划", x: 196, y: 316, cfg: { plan: "", gate: "90%" } },
+    { id: "n8", tp: "act-item", name: "更新缺陷状态", x: 384, y: 316, cfg: { st: "已修复", cmt: "开" } },
+    { id: "n9", tp: "ntf-msg", name: "通知验收", x: 196, y: 464, cfg: { tpl: "验收提醒" } },
+    { id: "n10", tp: "ntf-msg", name: "转人工处理", x: 8, y: 464, cfg: { tpl: "人工处理提醒" } }
+  ], edges: [
+    { f: "n1", t: "n2" }, { f: "n2", t: "n3", label: "是" }, { f: "n2", t: "n10", label: "否" },
+    { f: "n3", t: "n4" }, { f: "n4", t: "n5" }, { f: "n5", t: "n6" },
+    { f: "n6", t: "n7" }, { f: "n7", t: "n8" }, { f: "n8", t: "n9" }
+  ] },
+  { name: "流水线失败自愈", on: false, autoRun: false, trg: "流水线失败", nodes: [
+    { id: "m1", tp: "trg-pipe", name: "流水线失败", x: 8, y: 40, cfg: { pipe: "", ev: "失败" } },
+    { id: "m2", tp: "act-agent", name: "DSH 日志诊断", x: 196, y: 40, cfg: { task: "日志诊断", mode: "直接发送" } },
+    { id: "m3", tp: "op-cond", name: "能定位根因？", x: 384, y: 40, cfg: { f: "根因定位", op: "=", v: "成功" } },
+    { id: "m4", tp: "ntf-comment", name: "回写诊断结论", x: 384, y: 190, cfg: { tpl: "诊断结论" } },
+    { id: "m5", tp: "ntf-msg", name: "通知负责人", x: 196, y: 190, cfg: { tpl: "人工处理提醒" } }
+  ], edges: [
+    { f: "m1", t: "m2" }, { f: "m2", t: "m3" },
+    { f: "m3", t: "m4", label: "是" }, { f: "m3", t: "m5", label: "否" }
+  ] },
+  { name: "空白编排", on: false, autoRun: false, trg: "手动", nodes: [
+    { id: "e1", tp: "trg-item", name: "触发器", x: 16, y: 40, cfg: { tp: "缺陷", ev: "任意状态变更" } }
+  ], edges: [] }
+];
+
+function flowNodeSub(node) {
+  var type = FLOW_NODE_TYPES[node.tp];
+  return type ? String(type.sub(node) || type.name) : "";
+}
+
+function clampFlowNode(value) {
+  var source = value && typeof value === "object" ? value : {};
+  var type = FLOW_NODE_TYPES[source.tp] ? source.tp : "";
+  if (!type || !source.id) return null;
+  var cfg = {};
+  var rawCfg = source.cfg && typeof source.cfg === "object" && !Array.isArray(source.cfg) ? source.cfg : {};
+  Object.keys(rawCfg).slice(0, 12).forEach(function (key) {
+    if (key) cfg[String(key).slice(0, 60)] = String(rawCfg[key] === undefined || rawCfg[key] === null ? "" : rawCfg[key]).slice(0, 2000);
+  });
+  return {
+    id: String(source.id).slice(0, 64),
+    tp: type,
+    name: String(source.name || FLOW_NODE_TYPES[type].name).slice(0, 200),
+    x: Math.max(0, Math.min(20000, Math.round(Number(source.x) || 0))),
+    y: Math.max(0, Math.min(20000, Math.round(Number(source.y) || 0))),
+    cfg: cfg
+  };
+}
+
+// 从服务端流程定义重建一份可编辑副本（含缺省字段），避免直接改到持久化对象。
+function hydrateFlow(serverFlow) {
+  var source = serverFlow && typeof serverFlow === "object" ? serverFlow : {};
+  var nodes = (Array.isArray(source.nodes) ? source.nodes : []).map(clampFlowNode).filter(Boolean);
+  var ids = new Set(nodes.map(function (node) { return node.id; }));
+  var edges = (Array.isArray(source.edges) ? source.edges : [])
+    .map(function (edge) {
+      var value = edge && typeof edge === "object" ? edge : {};
+      var from = String(value.f || "").slice(0, 64);
+      var to = String(value.t || "").slice(0, 64);
+      return from && to && from !== to && ids.has(from) && ids.has(to)
+        ? { f: from, t: to, label: String(value.label || "").slice(0, 12) }
+        : null;
+    })
+    .filter(Boolean);
+  return {
+    id: String(source.id || "").slice(0, 64),
+    name: String(source.name || "未命名编排").slice(0, 200),
+    on: Boolean(source.on),
+    autoRun: Boolean(source.autoRun),
+    trg: String(source.trg || "").slice(0, 200),
+    nodes: nodes,
+    edges: edges,
+    runs: (Array.isArray(source.runs) ? source.runs : []).slice(0, 30)
+  };
+}
+
+function newFlowId() {
+  return "f" + Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
+}
 
 var CSS = [
   // 设计变量：浅色为默认，深色跟随系统。整体走“柔和分层”：不用硬描边，
@@ -23,6 +167,9 @@ var CSS = [
   ".dyx-root,.dyx-root *{box-sizing:border-box}",
   ".dyx-slot-host{width:100%;height:100%;min-height:0}",
   ".dyx-right-panel{position:absolute;inset:0 0 0 auto;width:var(--dyx-workspace-width,480px);min-width:0;overflow:hidden;pointer-events:auto;background:var(--dyx-bg);box-shadow:-12px 0 32px rgba(15,23,42,.08)}",
+  // 全页模式：面板改为 fixed 悬浮，从左侧导航轨右侧一直铺到窗口右缘——
+  // 不依赖宿主网格是否可改写，聊天区被整面盖住。
+  ".dyx-right-panel.dyx-panel-full{position:fixed!important;inset:0 0 0 var(--dyx-full-left,280px)!important;width:auto!important;box-shadow:none}",
   "[data-dyx-workspace-open='true']{grid-template-columns:var(--dyx-sidebar-track,280px) minmax(0,1fr) var(--dyx-workspace-width,480px)!important}[data-dyx-workspace-open='true'] [data-side='details']{left:calc(100% - var(--dyx-workspace-width,480px))!important}",
   ".dyx-resize-handle{position:absolute;z-index:50;inset:0 auto 0 0;width:8px;cursor:col-resize;touch-action:none;outline:0}.dyx-resize-handle::after{content:'';position:absolute;inset:0 auto 0 0;width:2px;background:transparent;transition:background .15s}.dyx-resize-handle:hover::after,.dyx-resize-handle:focus-visible::after,.dyx-resize-handle.active::after{background:var(--dyx-brand)}.dyx-resizing,.dyx-resizing *{cursor:col-resize!important;user-select:none!important}",
   ".dyx-preview-host{position:fixed;inset:12px 12px 12px auto;width:min(520px,calc(100vw - 24px));z-index:2147482500;overflow:hidden;border-radius:12px;box-shadow:var(--dyx-shadow)}",
@@ -44,7 +191,6 @@ var CSS = [
   // 卡片：无描边，靠白底 + 双层柔影从背景上浮起。
   ".dyx-card{padding:16px 18px 18px;border:0;border-radius:16px;background:var(--dyx-panel);box-shadow:var(--dyx-shadow-sm)}.dyx-card+.dyx-card{margin-top:14px}",
   ".dyx-card-head{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:14px}.dyx-card-head h3{margin:0;font-size:14px;font-weight:600}.dyx-card-head small{color:var(--dyx-muted);font-size:12px}.dyx-card-title{display:flex;align-items:center;gap:7px;min-width:0}",
-  ".dyx-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:10px}.dyx-account{padding:13px;border:0;border-radius:13px;background:var(--dyx-panel2);transition:box-shadow .15s,background .15s}.dyx-account:hover{background:var(--dyx-hover)}.dyx-account.active{background:color-mix(in srgb,var(--dyx-brand) 7%,var(--dyx-panel));box-shadow:0 0 0 2px color-mix(in srgb,var(--dyx-brand) 32%,transparent)}",
   ".dyx-account-top{display:flex;gap:10px;align-items:center;cursor:pointer}.dyx-avatar{width:36px;height:36px;display:grid;place-items:center;flex:none;border-radius:11px;color:#fff;background:linear-gradient(135deg,#5b8dff,#2f6bed);font-size:14px;font-weight:700;box-shadow:0 4px 10px rgba(47,107,237,.24)}.dyx-grow{min-width:0;flex:1}.dyx-grow strong,.dyx-grow small{display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.dyx-grow strong{font-size:13.5px;font-weight:600}.dyx-grow small{color:var(--dyx-muted);font-size:12px}",
   ".dyx-actions{display:flex;align-items:center;gap:6px;flex-wrap:wrap}.dyx-account-top .dyx-actions{flex:none}",
   // 按钮：默认为浅底填充的无边框样式，主按钮为品牌实底。
@@ -64,8 +210,8 @@ var CSS = [
   ".dyx-page{margin-top:12px;display:flex;justify-content:flex-end;align-items:center;gap:8px;color:var(--dyx-muted);font-size:12px}.dyx-page span{white-space:nowrap}",
   ".dyx-empty{padding:40px 16px;text-align:center;color:var(--dyx-muted);font-size:13px}.dyx-empty strong{display:block;margin-bottom:4px;color:var(--dyx-text);font-size:14px;font-weight:600}",
   ".dyx-attachments{display:grid;gap:7px}.dyx-attachment{display:flex;align-items:center;gap:8px;min-width:0;padding:8px 10px;border:0;border-radius:11px;background:var(--dyx-panel2)}.dyx-attachment-name{flex:1 1 auto;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.dyx-attachment-size{flex:none;color:var(--dyx-muted);font-size:12px}.dyx-attachment .dyx-btn{flex:none}",
-  ".dyx-drawer{position:absolute;inset:0;z-index:30;overflow:hidden;background:var(--dyx-bg);animation:dyx-slide-in .18s ease-out}@keyframes dyx-slide-in{from{transform:translateX(20px);opacity:.6}to{transform:none;opacity:1}}",
-  ".dyx-modal{width:100%;height:100%;display:grid;grid-template-rows:auto minmax(0,1fr) auto;overflow:hidden;background:var(--dyx-panel)}",
+  ".dyx-drawer{position:absolute;inset:0;z-index:30;display:grid;place-items:center;padding:22px;background:rgba(15,23,42,.45);animation:dyx-fade-in .16s ease-out}@keyframes dyx-fade-in{from{opacity:0}to{opacity:1}}",
+  ".dyx-modal{width:min(560px,100%);max-height:100%;display:grid;grid-template-rows:auto minmax(0,1fr) auto;overflow:hidden;border-radius:16px;background:var(--dyx-panel);box-shadow:var(--dyx-shadow);animation:dyx-pop-in .18s ease-out}.dyx-modal.wide{width:min(760px,100%)}@keyframes dyx-pop-in{from{transform:translateY(10px) scale(.98);opacity:.5}to{transform:none;opacity:1}}",
   ".dyx-modal-head,.dyx-modal-foot{padding:13px 18px;display:flex;align-items:center;justify-content:space-between;gap:12px}.dyx-modal-head{border-bottom:1px solid var(--dyx-line)}.dyx-modal-head h3{margin:0;font-size:15px;font-weight:650}.dyx-modal-foot{border-top:1px solid var(--dyx-line);justify-content:flex-end}.dyx-modal-body{padding:18px;overflow:auto;scrollbar-width:thin;scrollbar-color:var(--dyx-line-strong) transparent}.dyx-form{display:grid;gap:13px}.dyx-two{display:grid;grid-template-columns:1fr 1fr;gap:10px}",
   ".dyx-detail-title{display:flex;align-items:flex-start;gap:10px;margin-bottom:12px}.dyx-detail-title h2{margin:0;font-size:16px;font-weight:650;line-height:1.45}.dyx-meta{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:9px;margin:12px 0}.dyx-meta div{padding:9px 12px;border-radius:11px;background:var(--dyx-panel2);font-size:13px}.dyx-meta small{display:block;margin-bottom:1px;color:var(--dyx-muted);font-size:11.5px}",
   ".dyx-rich{line-height:1.75;overflow-wrap:anywhere;font-size:13.5px}.dyx-rich img{max-width:100%;height:auto;border-radius:10px}.dyx-rich pre,.dyx-log{overflow:auto;padding:13px;border:0;border-radius:12px;color:#c9d8f0;background:#0d1424;font:12px/1.65 Consolas,Menlo,Monaco,monospace;white-space:pre-wrap;scrollbar-width:thin;scrollbar-color:#3c4859 transparent}.dyx-rich table{border-collapse:collapse}.dyx-rich td,.dyx-rich th{border:1px solid var(--dyx-line-strong);padding:5px 8px}",
@@ -94,8 +240,91 @@ var CSS = [
   ".dyx-ctxmenu button{display:block;width:100%;min-height:29px;padding:5px 11px;border:0;border-radius:8px;background:transparent;color:var(--dyx-text);cursor:pointer;text-align:left;font:inherit;font-size:12.5px}",
   ".dyx-ctxmenu button:hover{background:var(--dyx-hover)}",
   "@keyframes dyx-fade-in{from{opacity:0}to{opacity:1}}",
-  "@container(max-width:430px){.dyx-main{padding:12px 14px 20px}.dyx-notify-grid,.dyx-project-row{grid-template-columns:1fr}.dyx-defect-filters .dyx-field{width:140px}.dyx-pipeline-filters .dyx-field{width:150px}.dyx-defect-row .dyx-inline-status{width:88px}.dyx-defect-row-assignee{max-width:96px}.dyx-title{display:block}.dyx-title>.dyx-btn,.dyx-title>.dyx-actions{margin-top:8px}.dyx-modal-body{padding:12px}.dyx-head{flex-wrap:wrap;gap:8px;padding:8px 10px 8px 14px}.dyx-nav{order:3;width:100%}.dyx-nav button{flex:1;min-height:30px;padding:5px 10px;font-size:12.5px}.dyx-status-row{align-items:stretch;flex-direction:column}.dyx-status-row .dyx-field{min-width:0;width:auto}}",
-  "@media(max-width:760px){.dyx-preview-host{inset:0;width:100%;border-radius:0}}"
+  // —— v4：缺陷/流水线页增强（全页宽布局）———————————————————————————————
+  // 统计卡条：方格小卡，固定宽度轨按容器自动换行，任何宽度下都不拉伸。
+  ".dyx-statstrip{display:grid;grid-template-columns:repeat(auto-fill,minmax(132px,168px));gap:10px;margin-bottom:14px}",
+  ".dyx-stat{position:relative;padding:11px 14px 12px;border:0;border-radius:14px;background:var(--dyx-panel);box-shadow:var(--dyx-shadow-sm);text-align:left;font:inherit;color:var(--dyx-text);overflow:hidden}",
+  ".dyx-stat small{position:relative;display:flex;align-items:center;gap:6px;color:var(--dyx-muted);font-size:12px}",
+  ".dyx-stat strong{position:relative;display:block;margin-top:4px;font-size:21px;font-weight:650;line-height:1.15;font-variant-numeric:tabular-nums;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}",
+  ".dyx-stat>span{position:relative;display:block;margin-top:2px;color:var(--dyx-muted);font-size:11.5px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}",
+  ".dyx-stat::after{content:'';position:absolute;right:-14px;top:-14px;width:52px;height:52px;border-radius:50%;background:var(--dyx-brand-weak);opacity:.6}",
+  ".dyx-stat.tone-ok strong{color:var(--dyx-ok)}.dyx-stat.tone-ok::after{background:var(--dyx-ok-weak)}.dyx-dot.tone-ok{background:#2eb17c}",
+  ".dyx-stat.tone-run strong{color:var(--dyx-warn)}.dyx-stat.tone-run::after{background:var(--dyx-warn-weak)}.dyx-dot.tone-run{background:#eaa63f}",
+  ".dyx-stat.tone-fail strong{color:var(--dyx-danger)}.dyx-stat.tone-fail::after{background:var(--dyx-danger-weak)}.dyx-dot.tone-fail{background:#e05a52}",
+  ".dyx-stat.tone-pending strong{color:var(--dyx-status-pending)}.dyx-stat.tone-pending::after{background:var(--dyx-status-pending-bg)}.dyx-dot.tone-pending{background:var(--dyx-status-pending)}",
+  ".dyx-stat.tone-processing strong{color:var(--dyx-status-processing)}.dyx-stat.tone-processing::after{background:var(--dyx-status-processing-bg)}.dyx-dot.tone-processing{background:var(--dyx-status-processing)}",
+  ".dyx-stat.tone-reopened strong{color:var(--dyx-status-reopened)}.dyx-stat.tone-reopened::after{background:var(--dyx-status-reopened-bg)}.dyx-dot.tone-reopened{background:var(--dyx-status-reopened)}",
+  "button.dyx-stat{cursor:pointer;transition:box-shadow .15s,transform .15s}button.dyx-stat:hover{box-shadow:0 0 0 2px color-mix(in srgb,var(--dyx-brand) 26%,transparent)}button.dyx-stat:active{transform:scale(.98)}",
+  "button.dyx-stat.active{box-shadow:0 0 0 2px color-mix(in srgb,var(--dyx-brand) 55%,transparent)}",
+  // 负责人徽章与属性小标签（优先级/严重度/迭代）。
+  ".dyx-person{display:inline-flex;align-items:center;gap:6px;min-width:0;max-width:170px;color:var(--dyx-muted);font-size:12px}",
+  ".dyx-person-avatar{width:18px;height:18px;flex:none;display:grid;place-items:center;border-radius:50%;color:#fff;font-size:10px;font-weight:600;box-shadow:0 2px 5px rgba(15,23,42,.18)}",
+  ".dyx-person-name{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}",
+  ".dyx-chip{flex:none;display:inline-flex;align-items:center;padding:1.5px 8px;border-radius:999px;color:var(--dyx-muted);background:var(--dyx-tag);font-size:11.5px;font-weight:500;line-height:1.6;white-space:nowrap}",
+  ".dyx-chip.hot{color:var(--dyx-danger);background:var(--dyx-danger-weak)}.dyx-chip.warm{color:var(--dyx-warn);background:var(--dyx-warn-weak)}",
+  // 缺陷页双栏：宽容器时通知配置移到右侧栏，窄容器自动回落到列表下方。
+  ".dyx-defects-layout{display:grid;grid-template-columns:minmax(0,1fr);gap:14px;align-items:start}",
+  ".dyx-defects-side{min-width:0}",
+  "@container(min-width:920px){.dyx-defects-layout{grid-template-columns:minmax(0,1fr) 300px}}",
+  // 流水线卡片：自适应多列网格 + 最近一次运行状态的同色左轨。
+  ".dyx-pipeline-grid{grid-template-columns:repeat(auto-fill,minmax(288px,1fr));gap:11px}",
+  ".dyx-pipeline-card{position:relative;overflow:hidden;padding-left:18px}",
+  ".dyx-pipeline-card::before{content:'';position:absolute;left:0;top:0;bottom:0;width:4px;background:var(--dyx-line-strong)}",
+  ".dyx-pipeline-card.tone-ok::before{background:#2eb17c}.dyx-pipeline-card.tone-run::before{background:#eaa63f}.dyx-pipeline-card.tone-fail::before{background:#e05a52}",
+  // 代码/测试/制品共用方格卡片：与流水线网格同规格，左轨按各自状态着色（无状态时保持默认轨）。
+  ".dyx-tile-grid{grid-template-columns:repeat(auto-fill,minmax(288px,1fr));gap:11px}",
+  ".dyx-tile-card{position:relative;overflow:hidden;padding-left:18px}",
+  ".dyx-tile-card::before{content:'';position:absolute;left:0;top:0;bottom:0;width:4px;background:var(--dyx-line-strong)}",
+  ".dyx-tile-card.tone-ok::before{background:#2eb17c}.dyx-tile-card.tone-run::before{background:#eaa63f}.dyx-tile-card.tone-fail::before{background:#e05a52}",
+  // 设置页账号卡片：当前账号带品牌色描边（放在 record-clickable 之后，悬停时描边不被覆盖）。
+  ".dyx-account{transition:box-shadow .15s,background .15s}.dyx-account .dyx-account-top{margin:10px 0 2px;cursor:inherit}",
+  ".dyx-account.active,.dyx-account.active:hover{background:color-mix(in srgb,var(--dyx-brand) 7%,var(--dyx-panel2));box-shadow:0 0 0 2px color-mix(in srgb,var(--dyx-brand) 32%,transparent)}",
+  // 设置页“当前项目 / DSH 工作区绑定”双栏：宽容器左右并排，窄容器回落为上下排列。
+  ".dyx-settings-layout{display:grid;grid-template-columns:minmax(0,1fr);gap:14px;align-items:start;margin-top:14px}.dyx-settings-layout>.dyx-card{margin-top:0}",
+  "@container(min-width:920px){.dyx-settings-layout{grid-template-columns:repeat(2,minmax(0,1fr))}}",
+  // 缺陷行：标签可能较多，允许换行；序号用等宽字体强化“编号”感。
+  ".dyx-defect-row-meta{flex-wrap:wrap}",
+  ".dyx-defect-row-serial{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;letter-spacing:.2px}",
+  // 缺陷列表方格卡片：宽容器多列，窄容器自然单列；标题最多两行。
+  ".dyx-defect-grid{grid-template-columns:repeat(auto-fill,minmax(330px,1fr));gap:11px}",
+  ".dyx-defect-card .dyx-defect-row-subject{white-space:normal;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;line-height:1.45}",
+  // 详情页图片：描述/评论中的图片与图片附件统一为小缩略图，横向并排、过多自动换行。
+  ".dyx-imgstrip{display:flex;flex-wrap:wrap;gap:8px;margin:10px 0 4px}",
+  ".dyx-imgstrip img{flex:none;width:132px;height:92px;object-fit:cover;border-radius:10px;background:var(--dyx-panel2);cursor:zoom-in}",
+  ".dyx-attachment-strip{display:flex;flex-wrap:wrap;gap:10px}",
+  ".dyx-attachment-thumb{display:flex;flex-direction:column;gap:4px;width:132px;min-width:0}",
+  ".dyx-attachment-thumb img{width:132px;height:92px;object-fit:cover;border-radius:10px;background:var(--dyx-panel2);cursor:zoom-in}",
+  ".dyx-attachment-thumb-name{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--dyx-muted);font-size:11.5px}",
+  "@container(max-width:640px){.dyx-head{flex-wrap:wrap;gap:8px;padding:8px 10px 8px 14px}.dyx-head-copy{flex:1 1 auto}.dyx-nav{order:3;width:100%}.dyx-nav button{flex:1 1 auto;min-height:30px;padding:5px 9px;font-size:12px}}",
+  "@container(max-width:430px){.dyx-main{padding:12px 14px 20px}.dyx-drawer{padding:12px}.dyx-notify-grid,.dyx-project-row{grid-template-columns:1fr}.dyx-defect-filters .dyx-field{width:140px}.dyx-pipeline-filters .dyx-field{width:150px}.dyx-defect-row .dyx-inline-status{width:88px}.dyx-defect-row-assignee{max-width:96px}.dyx-title{display:block}.dyx-title>.dyx-btn,.dyx-title>.dyx-actions{margin-top:8px}.dyx-modal-body{padding:12px}.dyx-status-row{align-items:stretch;flex-direction:column}.dyx-status-row .dyx-field{min-width:0;width:auto}}",
+  "@media(max-width:760px){.dyx-preview-host{inset:0;width:100%;border-radius:0}}",
+  // —— v3：多页工作台 / 全页模式 / 编排画布 ——————————————————————————————
+  ".dyx-nav{flex:0 1 auto;min-width:0;flex-wrap:wrap}",
+  ".dyx-expand{width:30px;min-height:30px;padding:0;border:0;border-radius:9px;color:var(--dyx-muted);background:transparent;cursor:pointer;font:inherit;font-size:14px;line-height:1}.dyx-expand:hover{color:var(--dyx-brand);background:var(--dyx-brand-weak)}",
+  // 全页模式：面板宽度由 applyPanelWidth 动态计算（100vw - 聊天保留宽），禁用拖拽手柄。
+  ".dyx-root[data-full='true'] .dyx-resize-handle{display:none}",
+  // 编排画布：左侧节点面板 + 右侧可拖拽画布；节点绝对定位，连线画在同一坐标系的 SVG 里。
+  ".dyx-flow-shell{display:grid;grid-template-columns:186px minmax(0,1fr);gap:0;border-radius:16px;background:var(--dyx-panel);box-shadow:var(--dyx-shadow-sm);overflow:hidden}",
+  ".dyx-flow-palette{padding:12px 10px;overflow:auto;max-height:640px;border-right:1px solid var(--dyx-line);scrollbar-width:thin}",
+  ".dyx-flow-palette h4{margin:10px 0 6px;color:var(--dyx-muted);font-size:11.5px;font-weight:600}.dyx-flow-palette h4:first-child{margin-top:0}",
+  ".dyx-flow-pi{display:flex;align-items:center;gap:8px;width:100%;min-height:38px;margin-bottom:4px;padding:6px 8px;border:0;border-radius:10px;background:transparent;cursor:pointer;text-align:left;font:inherit;font-size:12.5px;color:var(--dyx-text)}.dyx-flow-pi:hover{background:var(--dyx-brand-weak)}",
+  ".dyx-flow-pi span{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}",
+  ".dyx-flow-glyph{width:24px;height:24px;flex:none;display:grid;place-items:center;border-radius:8px;color:#fff;font-size:13px}",
+  ".dyx-flow-canvas{position:relative;height:640px;overflow:auto;background:radial-gradient(circle,var(--dyx-line) 1px,transparent 1px);background-size:18px 18px;scrollbar-width:thin;touch-action:none}",
+  ".dyx-flow-stage{position:relative;min-width:640px;min-height:600px;height:100%}",
+  ".dyx-flow-edges{position:absolute;inset:0;pointer-events:none}.dyx-flow-edges path{fill:none;stroke:var(--dyx-muted);stroke-width:1.6}.dyx-flow-edges path.danger{stroke:var(--dyx-danger)}.dyx-flow-edges path.ok{stroke:var(--dyx-ok)}",
+  ".dyx-flow-edges .dyx-flow-elabel{font-size:10px;fill:var(--dyx-muted)}",
+  ".dyx-flow-node{position:absolute;display:flex;align-items:center;gap:8px;width:172px;min-height:50px;padding:8px 10px;border-radius:12px;background:var(--dyx-panel);box-shadow:0 2px 8px rgba(15,23,42,.08);cursor:grab;user-select:none;touch-action:none;border:1.5px solid transparent}.dyx-flow-node:hover{box-shadow:var(--dyx-shadow-sm)}.dyx-flow-node.selected{border-color:var(--dyx-brand)}",
+  ".dyx-flow-node.run{border-color:var(--dyx-warn);box-shadow:0 0 0 3px var(--dyx-warn-weak)}.dyx-flow-node.ok{border-color:var(--dyx-ok)}.dyx-flow-node.fail{border-color:var(--dyx-danger);box-shadow:0 0 0 3px var(--dyx-danger-weak)}.dyx-flow-node.wait{border-color:var(--dyx-brand)}.dyx-flow-node.skip{opacity:.5}",
+  ".dyx-flow-node-glyph{width:26px;height:26px;flex:none;display:grid;place-items:center;border-radius:9px;color:#fff;font-size:13px}",
+  ".dyx-flow-node-text{min-width:0;flex:1}.dyx-flow-node-text b{display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:12px}.dyx-flow-node-text span{display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--dyx-muted);font-size:10.5px;margin-top:2px}",
+  ".dyx-flow-node-state{position:absolute;top:-8px;right:-8px;min-width:18px;height:18px;display:none;place-items:center;padding:0 4px;border-radius:999px;color:#fff;background:var(--dyx-muted);font-size:10px;font-weight:700}.dyx-flow-node.run .dyx-flow-node-state{display:grid;background:var(--dyx-warn)}.dyx-flow-node.ok .dyx-flow-node-state{display:grid;background:var(--dyx-ok)}.dyx-flow-node.fail .dyx-flow-node-state{display:grid;background:var(--dyx-danger)}.dyx-flow-node.skip .dyx-flow-node-state{display:grid}.dyx-flow-node.wait .dyx-flow-node-state{display:grid;background:var(--dyx-brand)}",
+  ".dyx-flow-port{position:absolute;top:calc(50% - 7px);width:14px;height:14px;padding:0;border:2px solid var(--dyx-muted);border-radius:50%;background:var(--dyx-panel);cursor:crosshair}.dyx-flow-port:hover{border-color:var(--dyx-brand)}.dyx-flow-port[data-side='out']{right:-8px}.dyx-flow-port[data-side='in']{left:-8px}",
+  ".dyx-flow-node-actions{position:absolute;left:0;right:0;bottom:-15px;display:flex;justify-content:center;gap:6px}",
+  ".dyx-flow-node-actions .dyx-btn{min-height:20px;padding:1px 9px;font-size:11px;border-radius:999px;box-shadow:var(--dyx-shadow-sm)}",
+  ".dyx-flow-note{padding:9px 12px;border-radius:11px;color:var(--dyx-muted);background:var(--dyx-panel2);font-size:12px}",
+  ".dyx-flow-checks{display:flex;gap:6px;flex-wrap:wrap}",
+  ".dyx-full-note{margin:0 0 10px}"
 ].join("");
 
 function node(tag, className, text) {
@@ -151,20 +380,25 @@ function dateValue(value) {
   return Number.isNaN(date.getTime()) ? 0 : date.getTime();
 }
 
+// 状态归类：统计条、记录底色与内联状态下拉共用同一套口径。
+function defectStatusKind(statusName) {
+  var normalized = String(statusName || "").trim();
+  if (["待确认", "未确认"].indexOf(normalized) >= 0) return "pending";
+  if (normalized === "处理中") return "processing";
+  if (["再次打开", "重新打开", "REOPEN", "REOPENED"].indexOf(normalized.toUpperCase()) >= 0) return "reopened";
+  return "";
+}
+
 function applyDefectStatusTone(select, statusName) {
   select.classList.remove("dyx-status-pending", "dyx-status-processing", "dyx-status-reopened");
-  var normalized = String(statusName || "").trim();
-  if (["待确认", "未确认"].indexOf(normalized) >= 0) select.classList.add("dyx-status-pending");
-  else if (normalized === "处理中") select.classList.add("dyx-status-processing");
-  else if (["再次打开", "重新打开", "REOPEN", "REOPENED"].indexOf(normalized.toUpperCase()) >= 0) select.classList.add("dyx-status-reopened");
+  var kind = defectStatusKind(statusName);
+  if (kind) select.classList.add("dyx-status-" + kind);
 }
 
 function applyDefectRecordTone(card, statusName) {
   card.classList.remove("dyx-record-status-pending", "dyx-record-status-processing", "dyx-record-status-reopened");
-  var normalized = String(statusName || "").trim();
-  if (["待确认", "未确认"].indexOf(normalized) >= 0) card.classList.add("dyx-record-status-pending");
-  else if (normalized === "处理中") card.classList.add("dyx-record-status-processing");
-  else if (["再次打开", "重新打开", "REOPEN", "REOPENED"].indexOf(normalized.toUpperCase()) >= 0) card.classList.add("dyx-record-status-reopened");
+  var kind = defectStatusKind(statusName);
+  if (kind) card.classList.add("dyx-record-status-" + kind);
 }
 
 // 仅“待确认”“再次打开”（含同义命名）的缺陷提供“草稿/处理”两个直达按钮。
@@ -194,6 +428,8 @@ function savePanelWidth(value) {
 
 function clampPanelWidth(value) {
   var viewport = document.documentElement.clientWidth || window.innerWidth || 1440;
+  // 全页模式：吃满除宿主左侧导航轨以外的整页宽度（覆盖中间聊天区），忽略常规上限与拖拽持久化。
+  if (FULL_MODE_ACTIVE) return Math.max(720, viewport - HOST_SIDEBAR_TRACK - FULL_MODE_RESERVE);
   var responsiveMax = Math.max(MIN_PANEL_WIDTH, viewport - 640);
   return Math.round(Math.min(MAX_PANEL_WIDTH, responsiveMax, Math.max(MIN_PANEL_WIDTH, Number(value) || DEFAULT_PANEL_WIDTH)));
 }
@@ -221,6 +457,51 @@ function statusClass(status) {
   if (["RUNNING", "QUEUED", "WAITING", "处理中"].indexOf(normalized) >= 0) return "run";
   if (["FAIL", "FAILED", "ERROR", "CANCELLED"].indexOf(normalized) >= 0) return "fail";
   return "";
+}
+
+// 统计卡：小标题 + 大数字 + 弱色角标圆；带 onClick 时渲染为按钮并作为筛选入口。
+function statTile(options) {
+  options = options || {};
+  var tile = node(options.onClick ? "button" : "div", "dyx-stat" + (options.tone ? " tone-" + options.tone : ""));
+  if (options.onClick) {
+    tile.type = "button";
+    tile.addEventListener("click", options.onClick);
+    if (options.active) tile.classList.add("active");
+  }
+  var head = node("small");
+  if (options.tone) head.append(node("span", "dyx-dot tone-" + options.tone));
+  head.append(node("span", "", options.label || ""));
+  tile.append(head, node("strong", "", String(options.value === undefined || options.value === null ? 0 : options.value)), node("span", "", options.hint || ""));
+  return tile;
+}
+
+// 属性小标签：优先级/严重度按档位给出热/暖色调。
+function defectChip(text, tone) {
+  return node("span", "dyx-chip" + (tone ? " " + tone : ""), text);
+}
+
+function defectChipTone(value) {
+  var normalized = String(value || "").trim().toUpperCase();
+  if (["P0", "P1", "最高", "严重", "BLOCKER", "CRITICAL", "MAJOR"].indexOf(normalized) >= 0) return "hot";
+  if (["P2", "中", "一般", "NORMAL", "MINOR"].indexOf(normalized) >= 0) return "warm";
+  return "";
+}
+
+// 负责人徽章：按姓名哈希取色，同一个人在各处颜色一致；未分配显示灰色占位。
+function personBadge(name) {
+  var wrap = node("span", "dyx-person");
+  var text = String(name || "").trim();
+  var avatar = node("span", "dyx-person-avatar", text ? text.slice(0, 1) : "无");
+  if (text) {
+    var hue = 0;
+    for (var index = 0; index < text.length; index++) hue = (hue * 31 + text.charCodeAt(index)) % 360;
+    avatar.style.background = "hsl(" + hue + " 52% 50%)";
+  } else {
+    avatar.style.background = "#98a4b5";
+  }
+  wrap.append(avatar, node("span", "dyx-person-name", text || "未分配"));
+  wrap.title = "负责人 " + (text || "未分配");
+  return wrap;
 }
 
 function rpc(method, args) {
@@ -263,13 +544,15 @@ function createDefectNotifier(options) {
     lastResultCount: 0,
     lastAddedCount: 0,
     lastQueryCount: 0,
-    lastSystemStatus: "尚未触发"
+    lastSystemStatus: "尚未触发",
+    lastAddedItems: []
   };
 
   function copySnapshot() {
     return Object.assign({}, snapshot, {
       settings: Object.assign({}, snapshot.settings),
-      assignees: snapshot.assignees.slice()
+      assignees: snapshot.assignees.slice(),
+      lastAddedItems: snapshot.lastAddedItems.slice()
     });
   }
 
@@ -423,6 +706,7 @@ function createDefectNotifier(options) {
           seenByScope.set(scope, new Set(ids));
           var addedSet = new Set(addedIds);
           var addedItems = (result.items || []).filter(function (item) { return item && addedSet.has(item.id); });
+          snapshot.lastAddedItems = addedItems.slice(0, 5);
           if (addedItems.length) {
             snapshot.lastAddedCount = addedItems.length;
             snapshot.unreadCount += addedItems.length;
@@ -526,7 +810,7 @@ function modal(title, wide) {
   var workspaceRoot = document.getElementById(ROOT_ID);
   if (!workspaceRoot) throw new Error("云效工作台尚未挂载");
   var drawer = node("div", "dyx-drawer");
-  var box = node("div", "dyx-modal");
+  var box = node("div", "dyx-modal" + (wide ? " wide" : ""));
   var head = node("div", "dyx-modal-head");
   var body = node("div", "dyx-modal-body");
   var foot = node("div", "dyx-modal-foot");
@@ -538,6 +822,7 @@ function modal(title, wide) {
     drawer.remove();
   }
   function onKeyDown(event) { if (event.key === "Escape") closeDrawer(); }
+  drawer.addEventListener("mousedown", function (event) { if (event.target === drawer) closeDrawer(); });
   var close = button("×", "dyx-close", closeDrawer);
   close.setAttribute("aria-label", "关闭" + title);
   head.append(node("h3", "", title), close);
@@ -551,7 +836,7 @@ function modal(title, wide) {
 function createWorkspace(onRequestClose, notifier, services) {
   var state = {
     server: { accounts: [], selectedAccountId: "" },
-    tab: "defects",
+    tab: "dashboard",
     projects: [],
     workspaces: [],
     workspacesError: "",
@@ -568,6 +853,11 @@ function createWorkspace(onRequestClose, notifier, services) {
     defectMembersLoading: false,
     pipelines: { items: [], total: 0, page: 1, pageSize: PAGE_SIZE },
     pipelineKeyword: "",
+    dashboard: { loaded: false },
+    code: { repos: [], total: 0, page: 1, pageSize: PAGE_SIZE, keyword: "", loaded: false, detail: null },
+    tests: { plans: [], total: 0, page: 1, pageSize: PAGE_SIZE, loaded: false },
+    packages: { repos: [], total: 0, page: 1, pageSize: PAGE_SIZE, loaded: false },
+    flows: { items: [], loaded: false, active: 0, sel: "", connectFrom: "", selEdge: -1, run: null, runCtx: null },
     open: false
   };
   var root;
@@ -583,6 +873,8 @@ function createWorkspace(onRequestClose, notifier, services) {
   var branchDatalistSeq = 0;
   var notificationAssigneesScope = "";
   var unsubscribeNotifier = null;
+  var defectResizeTimer = null;
+  var onViewportResize = null;
 
   function selectedAccount() {
     return state.server.accounts.find(function (item) { return item.id === state.server.selectedAccountId; }) || null;
@@ -640,6 +932,11 @@ function createWorkspace(onRequestClose, notifier, services) {
       state.workspacesLoaded = true;
       loadWorkspaces();
     }
+    if (tab === "dashboard") loadDashboard();
+    if (tab === "code" && !state.code.loaded) loadCodeRepos();
+    if (tab === "tests" && !state.tests.loaded) loadTestPlans();
+    if (tab === "packages" && !state.packages.loaded) loadPackageRepos();
+    if (tab === "flows" && !state.flows.loaded) loadFlows();
   }
 
   function loadWorkspaces() {
@@ -655,9 +952,14 @@ function createWorkspace(onRequestClose, notifier, services) {
 
   function render() {
     main.textContent = "";
+    if (state.tab === "dashboard") renderDashboard();
     if (state.tab === "overview") renderOverview();
     if (state.tab === "defects") renderDefects();
     if (state.tab === "pipelines") renderPipelines();
+    if (state.tab === "code") renderCode();
+    if (state.tab === "tests") renderTests();
+    if (state.tab === "packages") renderPackages();
+    if (state.tab === "flows") renderFlows();
   }
 
   function renderOverview() {
@@ -668,40 +970,37 @@ function createWorkspace(onRequestClose, notifier, services) {
     title.append(copy, button("新增账号", "primary", function () { openAccountForm(null); }));
     section.append(title);
 
+    var account = selectedAccount();
+    var project = account && account.selectedProject || null;
+    var workspace = account && account.workspace || null;
+    var notification = account && account.defectNotification || null;
+    var accounts = state.server.accounts;
+    var tokenReady = accounts.filter(function (item) { return item.hasToken; }).length;
+    // 统计条：账号 / 令牌 / 项目 / 工作区 / 通知的配置状态一览，与各列表页同款方格小卡。
+    var strip = node("div", "dyx-statstrip");
+    strip.append(
+      statTile({ label: "云效账号", value: accounts.length, hint: account ? "当前 " + account.name : "尚未选择账号" }),
+      statTile({ label: "令牌已配置", tone: !accounts.length ? "" : tokenReady === accounts.length ? "ok" : "fail", value: tokenReady, hint: accounts.length ? "共 " + accounts.length + " 个账号" : "新增账号后填写令牌" }),
+      statTile({ label: "当前项目", tone: project ? "ok" : "", value: project ? "已选择" : "未选择", hint: project ? project.name : "在下方选择项目" }),
+      statTile({ label: "DSH 工作区", tone: workspace ? "ok" : "", value: workspace ? "已绑定" : "未绑定", hint: workspace ? (workspace.title || workspace.id) : "绑定后可一键处理缺陷" }),
+      statTile({ label: "缺陷通知", tone: notification && notification.enabled ? "ok" : "", value: notification && notification.enabled ? "已开启" : "未开启", hint: notification && notification.enabled ? "每 " + (notification.intervalMinutes || DEFAULT_NOTIFICATION_INTERVAL) + " 分钟检查" : "在“工作项”页配置", onClick: function () { setTab("defects"); } })
+    );
+    section.append(strip);
+
     var accountsCard = node("div", "dyx-card");
     var accountsHead = node("div", "dyx-card-head");
-    accountsHead.append(node("h3", "", "云效账号"), node("small", "", state.server.accounts.length + " 个"));
+    accountsHead.append(node("h3", "", "云效账号"), node("small", "", accounts.length ? accounts.length + " 个 · 点击卡片切换当前账号" : "0 个"));
     accountsCard.append(accountsHead);
-    if (!state.server.accounts.length) {
-      accountsCard.append(empty("还没有云效账号", "新增账号后即可读取项目、缺陷和流水线。"));
-    } else {
-      var grid = node("div", "dyx-grid");
-      state.server.accounts.forEach(function (account) {
-        var card = node("div", "dyx-account" + (account.id === state.server.selectedAccountId ? " active" : ""));
-        var top = node("div", "dyx-account-top");
-        var avatar = node("div", "dyx-avatar", (account.name || "云").slice(0, 1));
-        var grow = node("div", "dyx-grow");
-        grow.append(node("strong", "", account.name), node("small", "", account.organizationId));
-        var actions = node("div", "dyx-actions");
-        actions.append(
-          button("编辑", "", function () { openAccountForm(account); }),
-          button("删除", "danger", function () { removeAccount(account); })
-        );
-        actions.addEventListener("click", function (event) { event.stopPropagation(); });
-        top.append(avatar, grow, node("span", "dyx-badge " + (account.hasToken ? "ok" : "fail"), account.hasToken ? "令牌已配置" : "缺少令牌"), actions);
-        top.addEventListener("click", function () { chooseAccount(account.id); });
-        card.append(top);
-        grid.append(card);
-      });
-      accountsCard.append(grid);
-    }
+    if (!accounts.length) accountsCard.append(empty("还没有云效账号", "新增账号后即可读取项目、缺陷和流水线。"));
+    else accountsCard.append(accountGrid(accounts));
     section.append(accountsCard);
 
+    // 项目选择与工作区绑定：宽容器左右并排，窄容器自动上下排列。
+    var layout = node("div", "dyx-settings-layout");
     var projectCard = node("div", "dyx-card");
     var projectHead = node("div", "dyx-card-head");
     projectHead.append(node("h3", "", "当前项目"), button("从云效刷新", "", loadProjects));
     projectCard.append(projectHead);
-    var account = selectedAccount();
     if (!account) {
       projectCard.append(empty("请先选择账号", "项目按账号和组织分别读取。"));
     } else {
@@ -710,36 +1009,73 @@ function createWorkspace(onRequestClose, notifier, services) {
       var placeholder = node("option", "", state.projects.length ? "选择一个项目" : "点击右侧按钮读取项目");
       placeholder.value = "";
       select.append(placeholder);
-      state.projects.forEach(function (project) {
-        var option = node("option", "", project.name);
-        option.value = project.id;
-        if (account.selectedProject && account.selectedProject.id === project.id) option.selected = true;
+      state.projects.forEach(function (item) {
+        var option = node("option", "", item.name);
+        option.value = item.id;
+        if (project && project.id === item.id) option.selected = true;
         select.append(option);
       });
       row.append(select, button("设为当前项目", "primary", function () {
-        var project = state.projects.find(function (item) { return item.id === select.value; });
-        if (!project) return toast("请选择项目", true);
+        var chosen = state.projects.find(function (item) { return item.id === select.value; });
+        if (!chosen) return toast("请选择项目", true);
         setBusy(projectCard, true);
-        rpc("project.select", { accountId: account.id, project: project })
+        rpc("project.select", { accountId: account.id, project: chosen })
           .then(loadState)
           .then(function () { return notifier ? notifier.refresh() : null; })
-          .then(function () { notificationAssigneesScope = ""; toast("已切换到“" + project.name + "”"); render(); })
+          .then(function () { notificationAssigneesScope = ""; toast("已切换到“" + chosen.name + "”"); render(); })
           .catch(function (error) { toast(error.message, true); })
           .finally(function () { setBusy(projectCard, false); });
       }));
       projectCard.append(row);
       var current = node("div", "dyx-current");
-      if (account.selectedProject) current.append(node("span", "", "当前："), node("strong", "", account.selectedProject.name), node("span", "", "  ·  " + account.selectedProject.id));
+      if (project) current.append(node("span", "", "当前："), node("strong", "", project.name), node("span", "", "  ·  " + project.id));
       else current.textContent = "尚未选择项目。选择后，缺陷与流水线页面会自动使用该项目上下文。";
       projectCard.append(current);
     }
-    section.append(projectCard);
-    renderWorkspaceBinding(section, account);
+    layout.append(projectCard);
+    renderWorkspaceBinding(layout, account);
+    section.append(layout);
     main.append(section);
   }
 
+  // 账号方格卡片：令牌状态着左轨，当前账号带品牌色描边；整卡点击切换，按钮区域不冒泡。
+  function accountGrid(accounts) {
+    var wrap = node("div", "dyx-record-list dyx-tile-grid");
+    accounts.forEach(function (account) {
+      var active = account.id === state.server.selectedAccountId;
+      var card = node("article", "dyx-record dyx-record-clickable dyx-tile-card dyx-account" + (active ? " active" : "") + (account.hasToken ? " tone-ok" : " tone-fail"));
+      card.addEventListener("click", function (event) {
+        if (event.target.closest("button")) return;
+        if (!active) chooseAccount(account.id);
+      });
+      var head = node("div", "dyx-record-head");
+      var badges = node("div", "dyx-actions");
+      badges.append(node("span", "dyx-badge " + (account.hasToken ? "ok" : "fail"), account.hasToken ? "令牌已配置" : "缺少令牌"));
+      if (active) badges.append(node("span", "dyx-badge", "当前账号"));
+      head.append(badges);
+      var top = node("div", "dyx-account-top");
+      var avatar = node("div", "dyx-avatar", (account.name || "云").slice(0, 1));
+      var grow = node("div", "dyx-grow");
+      grow.append(node("strong", "", account.name), node("small", "", account.organizationId));
+      top.append(avatar, grow);
+      var foot = node("div", "dyx-record-foot");
+      var current = node("span", "dyx-muted", account.selectedProject ? "项目 " + account.selectedProject.name : "未选择项目");
+      current.title = account.selectedProject ? account.selectedProject.name + " · " + account.selectedProject.id : "";
+      var actions = node("div", "dyx-actions");
+      if (!active) actions.append(button("设为当前", "dyx-btn-sm", function () { chooseAccount(account.id); }));
+      actions.append(
+        button("编辑", "dyx-btn-sm", function () { openAccountForm(account); }),
+        button("删除", "dyx-btn-sm danger", function () { removeAccount(account); })
+      );
+      foot.append(current, actions);
+      card.append(head, top, foot);
+      wrap.append(card);
+    });
+    return wrap;
+  }
+
   // DSH 工作区绑定：按账号+项目保存；绑定后缺陷列表可一键处理到该工作区的会话。
-  function renderWorkspaceBinding(section, account) {
+  function renderWorkspaceBinding(container, account) {
     var project = account && account.selectedProject || null;
     var workspace = account && account.workspace || null;
     var card = node("div", "dyx-card");
@@ -748,7 +1084,7 @@ function createWorkspace(onRequestClose, notifier, services) {
     card.append(head);
     if (!account || !project) {
       card.append(empty(!account ? "请先选择账号" : "请先选择项目", "工作区绑定按账号和项目分别保存。"));
-      section.append(card);
+      container.append(card);
       return;
     }
     var row = node("div", "dyx-project-row");
@@ -785,7 +1121,7 @@ function createWorkspace(onRequestClose, notifier, services) {
       current.textContent = "未绑定。绑定后可在缺陷列表或详情点击“草稿”“处理”，把缺陷转为该工作区新会话的草稿，或直接发送。";
     }
     card.append(current);
-    section.append(card);
+    container.append(card);
   }
 
   function saveWorkspaceBinding(workspaceId, successText) {
@@ -981,10 +1317,37 @@ function createWorkspace(onRequestClose, notifier, services) {
     var section = node("section", "dyx-section");
     var title = node("div", "dyx-title");
     var copy = node("div");
-    copy.append(node("h2", "", "缺陷"), node("p", "", "实时读取云效工作项，按创建时间从新到旧排列；页面底部可配置新增缺陷提醒。"));
+    copy.append(node("h2", "", "缺陷"), node("p", "", "实时读取云效工作项，按创建时间从新到旧排列；点击顶部统计卡可按状态快速筛选。"));
     title.append(copy, button("刷新", "", loadDefects));
     section.append(title);
     if (!renderRequirement(section)) { main.append(section); return; }
+    var items = state.defects.items || [];
+    var activeStatus = state.defectFilters.statusName || "";
+    // 统计卡点击即切换状态筛选：再次点击已选中的卡取消筛选，“全部”用于清空。
+    function setDefectStatusFilter(name) {
+      state.defectFilters.statusName = name || "";
+      if (defectStatusFilterControl) {
+        defectStatusFilterControl.value = name || "";
+        var wrap = defectStatusFilterControl.closest(".dyx-filter-control");
+        var clear = wrap ? wrap.querySelector(".dyx-filter-clear") : null;
+        if (clear) clear.hidden = !name;
+      }
+      state.defects.page = 1;
+      loadDefects();
+    }
+    function kindCount(kind) {
+      return items.filter(function (item) { return defectStatusKind(item.statusName) === kind; }).length;
+    }
+    // 统计条：“全部”取服务端总数，状态计数来自当前页。
+    var strip = node("div", "dyx-statstrip");
+    var specialCount = kindCount("pending") + kindCount("processing") + kindCount("reopened");
+    strip.append(
+      statTile({ label: "全部缺陷", value: state.defects.total || items.length, hint: "本页 " + items.length + " 条", active: !activeStatus, onClick: function () { if (activeStatus) setDefectStatusFilter(""); } }),
+      statTile({ label: "待确认", tone: "pending", value: kindCount("pending"), hint: "本页计数", active: activeStatus === "待确认", onClick: function () { setDefectStatusFilter(activeStatus === "待确认" ? "" : "待确认"); } }),
+      statTile({ label: "处理中", tone: "processing", value: kindCount("processing"), hint: "本页计数", active: activeStatus === "处理中", onClick: function () { setDefectStatusFilter(activeStatus === "处理中" ? "" : "处理中"); } }),
+      statTile({ label: "再次打开", tone: "reopened", value: kindCount("reopened"), hint: "本页计数", active: activeStatus === "再次打开", onClick: function () { setDefectStatusFilter(activeStatus === "再次打开" ? "" : "再次打开"); } }),
+      statTile({ label: "其他状态", value: Math.max(0, items.length - specialCount), hint: "本页计数" })
+    );
     var card = node("div", "dyx-card");
     var tools = node("div", "dyx-defect-filters");
     var status = node("select", "dyx-select");
@@ -1033,12 +1396,17 @@ function createWorkspace(onRequestClose, notifier, services) {
     toolbar.append(tools, pager(state.defects, onPage));
     card.append(toolbar);
     if (state.defects.stale) card.append(node("div", "dyx-stale", "云效暂时不可用，当前为 " + formatDate(state.defects.cachedAt) + " 的缓存。"));
-    if (!state.defects.items.length) card.append(empty("暂无缺陷", "可调整关键词后重新查询。"));
-    else card.append(defectTable(state.defects.items));
+    if (!items.length) card.append(empty("暂无缺陷", "可调整筛选条件后重新查询。"));
+    else card.append(defectTable(items));
     card.append(pager(state.defects, onPage));
-    section.append(card);
-    // 缺陷通知按账号+项目生效，配置与未处理数展示在缺陷页底部，不再放在设置页。
-    renderDefectNotification(section, selectedAccount());
+    // 双栏布局：列表在左，缺陷通知配置在右（宽容器并排，窄容器回落到下方）。
+    var layout = node("div", "dyx-defects-layout");
+    var column = node("div", "dyx-defects-main");
+    var side = node("div", "dyx-defects-side");
+    column.append(strip, card);
+    layout.append(column, side);
+    section.append(layout);
+    renderDefectNotification(side, selectedAccount());
     main.append(section);
   }
 
@@ -1086,11 +1454,11 @@ function createWorkspace(onRequestClose, notifier, services) {
     actions.append(button("详情", "dyx-btn-sm", function () { openDefect(item); }));
   }
 
-  // 列表压缩为两行：标题独占一行超长省略，负责人、状态、创建时间与操作按钮同行。
+  // 列表为方格卡片网格：标题（最多两行）、可选缩略图、负责人/状态下拉与标签、操作按钮。
   function defectTable(items) {
-    var wrap = node("div", "dyx-record-list");
+    var wrap = node("div", "dyx-record-list dyx-defect-grid");
     items.forEach(function (item) {
-      var row = node("article", "dyx-record dyx-defect-row");
+      var row = node("article", "dyx-record dyx-defect-row dyx-defect-card");
       applyDefectRecordTone(row, item.statusName);
       var statusSelect = node("select", "dyx-select dyx-inline-status");
       statusSelect.setAttribute("aria-label", "修改 " + (item.serialNumber || "缺陷") + " 状态");
@@ -1109,14 +1477,21 @@ function createWorkspace(onRequestClose, notifier, services) {
       title.title = titleText;
       title.append(node("span", "dyx-defect-row-serial", item.serialNumber || "缺陷"), node("span", "dyx-defect-row-subject", item.subject || "未命名缺陷"));
       title.addEventListener("click", function () { openDefect(item); });
-      var assignee = node("span", "dyx-defect-row-assignee", item.assignedToName || "未分配");
-      assignee.title = "负责人 " + (item.assignedToName || "未分配");
+      var assignee = personBadge(item.assignedToName);
       var time = node("span", "dyx-defect-row-time", shortDateTime(item.gmtCreate || item.gmtModified));
       time.title = "创建 " + formatDate(item.gmtCreate || item.gmtModified);
       var meta = node("div", "dyx-defect-row-meta");
       var actions = node("div", "dyx-actions");
       fillDefectRowActions(actions, item);
-      meta.append(assignee, statusSelect, time, actions);
+      meta.append(assignee, statusSelect);
+      // 优先级/严重度按档位着色，迭代与创建人仅在存在时展示，避免空标签。
+      var priority = String(item.priority || "").trim();
+      if (priority) meta.append(defectChip("优先级 " + priority, defectChipTone(priority)));
+      var severity = String(item.severity || "").trim();
+      if (severity) meta.append(defectChip(severity, defectChipTone(severity)));
+      var sprint = String(item.sprintName || "").trim();
+      if (sprint) meta.append(defectChip(sprint));
+      meta.append(time, actions);
       row.append(title, meta);
       wrap.append(row);
     });
@@ -1214,10 +1589,12 @@ function createWorkspace(onRequestClose, notifier, services) {
   }
 
   // 云效 workitems:search 是搜索索引，修改后立即查询可能返回旧值；
-  // 修改成功返回后等半秒再刷新，避开索引延迟。
+  // 修改成功返回后等半秒再刷新，避开索引延迟。概览页复用同一套缺陷卡片，也在这里刷新。
   function reloadDefectsSoon() {
     setTimeout(function () {
-      if (state.tab === "defects" && selectedProject()) loadDefects();
+      if (!selectedProject()) return;
+      if (state.tab === "defects") loadDefects();
+      else if (state.tab === "dashboard") loadDashboard();
     }, 500);
   }
 
@@ -1246,8 +1623,27 @@ function createWorkspace(onRequestClose, notifier, services) {
       });
   }
 
+  // 自适应分页：按工作台当前可用宽高估算方格卡片的“列数 × 行数”作为每页条数。
+  // 列宽按卡片最小 330px + 11px 间距估算；行高按卡片约 130px + 11px 间距估算；
+  // 高度预留页头/统计条/筛选栏/分页条；结果钳制在 4–100（服务端上限 100）。
+  function computeDefectPageSize() {
+    var containerWidth = (main && main.clientWidth) || 1200;
+    var viewportHeight = window.innerHeight || 900;
+    var listWidth = containerWidth >= 920 ? containerWidth - 314 : containerWidth; // 双栏时右侧通知栏占 300 + 14 间距
+    var columns = Math.max(1, Math.floor((listWidth + 11) / 341));
+    var availableHeight = Math.max(300, viewportHeight - 330);
+    var rows = Math.max(1, Math.floor(availableHeight / 141));
+    return Math.min(100, Math.max(4, columns * rows));
+  }
+
   function loadDefects() {
     if (!selectedProject()) return render();
+    // 宽高变化后每页条数随之调整；变化时回到第一页重新查询。
+    var desiredPageSize = computeDefectPageSize();
+    if (desiredPageSize !== state.defects.pageSize) {
+      state.defects.pageSize = desiredPageSize;
+      state.defects.page = 1;
+    }
     var revision = ++defectLoadRevision;
     setBusy(main, true);
     rpc("defects.list", rpcArgs({
@@ -1519,9 +1915,19 @@ function createWorkspace(onRequestClose, notifier, services) {
     var rich = node("div", "dyx-rich"); renderRich(rich, detail.description || "", detail.descriptionFormat || "RICHTEXT", detail.attachments || [], item.id, callRpc); dialog.body.append(rich);
     if (detail.attachments && detail.attachments.length) {
       dialog.body.append(node("h3", "", "附件"));
-      var files = node("div", "dyx-attachments");
-      detail.attachments.forEach(function (file) { files.append(attachmentRow(item, file)); });
-      dialog.body.append(files);
+      // 图片附件以小缩略图横向排列（过多自动换行），其余文件保持行式列表。
+      var imageFiles = detail.attachments.filter(function (file) { return fileImageMediaType(file); });
+      var otherFiles = detail.attachments.filter(function (file) { return !fileImageMediaType(file); });
+      if (imageFiles.length) {
+        var thumbStrip = node("div", "dyx-attachment-strip");
+        imageFiles.forEach(function (file) { thumbStrip.append(attachmentThumb(item, file)); });
+        dialog.body.append(thumbStrip);
+      }
+      if (otherFiles.length) {
+        var files = node("div", "dyx-attachments");
+        otherFiles.forEach(function (file) { files.append(attachmentRow(item, file)); });
+        dialog.body.append(files);
+      }
     }
     var commentCount = detail.comments && detail.comments.length || 0;
     dialog.body.append(node("h3", "", "评论（" + commentCount + "）"));
@@ -1573,6 +1979,31 @@ function createWorkspace(onRequestClose, notifier, services) {
       dialog.body.append(comments);
     } else dialog.body.append(empty("暂无评论", "发布第一条评论。"));
     dialog.foot.textContent = ""; dialog.foot.append(button("关闭", "", dialog.close));
+  }
+
+  // 图片附件缩略图：小尺寸横向排列，点击进入全屏预览；
+  // 直链过期时加载失败自动换取新地址重试一次。
+  function attachmentThumb(defect, file) {
+    var tile = node("div", "dyx-attachment-thumb");
+    var img = node("img");
+    var snapshotUrl = safeUrl(file.url, true);
+    if (snapshotUrl) img.src = snapshotUrl;
+    img.alt = file.fileName || "图片";
+    img.loading = "lazy";
+    img.addEventListener("click", function () { previewDefectAttachment(defect, file); });
+    img.addEventListener("error", function () {
+      if (!defect.id || !file.fileId || tile.dataset.refreshed) return;
+      tile.dataset.refreshed = "1";
+      callRpc("defect.attachment.link", { defectId: defect.id, fileId: file.fileId }).then(function (result) {
+        var url = safeUrl(result && result.url, true);
+        if (url) img.src = url;
+      }).catch(function () {});
+    });
+    var size = formatBytes(file.size);
+    var name = node("span", "dyx-attachment-thumb-name", file.fileName || "图片");
+    name.title = (file.fileName || "图片") + (size ? "（" + size + "）" : "");
+    tile.append(img, name);
+    return tile;
   }
 
   // 云效附件直链具有时效性：点击时实时换取新地址，失败再退回详情里的快照地址。
@@ -1637,39 +2068,66 @@ function createWorkspace(onRequestClose, notifier, services) {
     var copy = node("div"); copy.append(node("h2", "", "流水线"), node("p", "", "组织级列表，可查看代码源、运行记录和任务日志，并手动触发运行。"));
     title.append(copy, button("刷新", "", loadPipelines)); section.append(title);
     if (!renderRequirement(section)) { main.append(section); return; }
+    var items = state.pipelines.items || [];
+    // 统计条：总数取服务端，运行状态计数来自当前页。
+    var counts = { ok: 0, run: 0, fail: 0, other: 0 };
+    items.forEach(function (item) {
+      var kind = statusClass(item.status);
+      if (kind === "ok") counts.ok++;
+      else if (kind === "run") counts.run++;
+      else if (kind === "fail") counts.fail++;
+      else counts.other++;
+    });
+    var strip = node("div", "dyx-statstrip");
+    strip.append(
+      statTile({ label: "全部流水线", value: state.pipelines.total || items.length, hint: "本页 " + items.length + " 条" }),
+      statTile({ label: "最近成功", tone: "ok", value: counts.ok, hint: "本页计数" }),
+      statTile({ label: "运行中", tone: "run", value: counts.run, hint: "本页计数" }),
+      statTile({ label: "最近失败", tone: "fail", value: counts.fail, hint: "本页计数" }),
+      statTile({ label: "暂无运行", value: counts.other, hint: "本页计数" })
+    );
     var card = node("div", "dyx-card");
     var keyword = input("text", "流水线名称", state.pipelineKeyword);
+    // 输入框内直接回车即查询，不必点击“查询”。
+    keyword.setAttribute("aria-label", "按名称搜索流水线");
+    keyword.addEventListener("keydown", function (event) {
+      if (event.key === "Enter") { state.pipelineKeyword = keyword.value.trim(); state.pipelines.page = 1; loadPipelines(); }
+    });
     function onPage(next) { state.pipelines.page = next; loadPipelines(); }
     var filters = node("div", "dyx-pipeline-filters");
-    filters.append(field("关键词", keyword), button("查询", "primary", function () { state.pipelineKeyword = keyword.value.trim(); state.pipelines.page = 1; loadPipelines(); }), button("清空", "", function () { state.pipelineKeyword = ""; state.pipelines.page = 1; loadPipelines(); }));
+    filters.append(field("关键词", keyword), button("查询", "primary", function () { state.pipelineKeyword = keyword.value.trim(); state.pipelines.page = 1; loadPipelines(); }), button("清空", "", function () { if (!state.pipelineKeyword && !keyword.value) return; state.pipelineKeyword = ""; keyword.value = ""; state.pipelines.page = 1; loadPipelines(); }));
     var toolbar = node("div", "dyx-list-toolbar");
     toolbar.append(filters, pager(state.pipelines, onPage));
     card.append(toolbar);
     if (state.pipelines.stale) card.append(node("div", "dyx-stale", "云效暂时不可用，当前为 " + formatDate(state.pipelines.cachedAt) + " 的缓存。"));
-    if (!state.pipelines.items.length) card.append(empty("暂无流水线", "当前账号在该组织中可能没有流水线权限。"));
-    else card.append(pipelineTable(state.pipelines.items));
+    if (!items.length) card.append(empty("暂无流水线", "当前账号在该组织中可能没有流水线权限。"));
+    else card.append(pipelineTable(items));
     card.append(pager(state.pipelines, onPage));
-    section.append(card); main.append(section);
+    section.append(strip, card); main.append(section);
   }
 
   function pipelineTable(items) {
-    var wrap = node("div", "dyx-record-list");
+    var wrap = node("div", "dyx-record-list dyx-pipeline-grid");
     items.forEach(function (item) {
-      var card = node("article", "dyx-record dyx-record-clickable");
+      var kind = statusClass(item.status);
+      var card = node("article", "dyx-record dyx-record-clickable dyx-pipeline-card" + (kind ? " tone-" + kind : ""));
       // 整卡点击进入详情；按钮区域（详情/运行）保持自身行为，不冒泡重复触发。
       card.addEventListener("click", function (event) {
         if (event.target.closest("button")) return;
         openPipeline(item);
       });
       var head = node("div", "dyx-record-head");
-      head.append(node("span", "dyx-badge", "#" + item.id), node("span", "dyx-badge " + statusClass(item.status), item.status || "暂无运行"));
+      head.append(node("span", "dyx-badge", "#" + item.id), node("span", "dyx-badge " + kind, item.status || "暂无运行"));
       var title = node("button", "dyx-link dyx-record-title", item.name || "未命名流水线");
       title.type = "button";
+      title.title = item.name || "未命名流水线";
       title.addEventListener("click", function () { openPipeline(item); });
       var foot = node("div", "dyx-record-foot");
+      var updated = node("span", "dyx-muted", "更新 " + shortDateTime(item.updateTime));
+      updated.title = "更新 " + formatDate(item.updateTime);
       var actions = node("div", "dyx-actions");
       actions.append(button("详情", "", function () { openPipeline(item); }), button("运行", "primary", function () { openRunPipeline(item); }));
-      foot.append(node("span", "dyx-muted", formatDate(item.updateTime)), actions);
+      foot.append(updated, actions);
       card.append(head, title, foot);
       wrap.append(card);
     });
@@ -1721,27 +2179,61 @@ function createWorkspace(onRequestClose, notifier, services) {
     dialog.foot.textContent = ""; dialog.foot.append(button("关闭", "", dialog.close));
   }
 
+  // 运行弹窗立即渲染：先给出备注与“确认运行”，分支读取成功后补充代码源控件，
+  // 读取失败也不阻塞——可直接用流水线默认配置运行，或手动填写分支。
   function openRunPipeline(pipeline) {
     var dialog = modal("运行流水线：" + pipeline.name, true);
-    dialog.body.append(empty("正在读取代码源与分支", "Codeup 分支会自动加载；无论是否读取到，都可以手动输入分支名称。"));
+    var form = node("div", "dyx-form");
+    var statusNote = node("div", "dyx-note", "正在读取代码源与分支…");
+    var sourceFields = [];
+    var manualBranchInput = null;
+    var commentInput = input("textarea", "可选，填写本次运行备注");
+    var commentField = field("运行备注", commentInput);
+    form.append(commentField);
+    dialog.body.append(statusNote, form);
+    function confirmRun(event) {
+      var runningBranches = {}; var branchModeBranches = []; var missingRepo = [];
+      sourceFields.forEach(function (entry) {
+        if (entry.source.isBranchMode) {
+          if (entry.control.multiple) {
+            Array.from(entry.control.selectedOptions).forEach(function (option) { var value = option.value.trim(); if (value) branchModeBranches.push(value); });
+          } else {
+            var manual = entry.control.value.trim();
+            if (manual) branchModeBranches.push(manual);
+          }
+          return;
+        }
+        var value = entry.control.value.trim();
+        if (!value) return;
+        if (entry.source.repo) runningBranches[entry.source.repo] = value;
+        else missingRepo.push(entry.source.name || "代码源");
+      });
+      if (manualBranchInput) { var manualValue = manualBranchInput.value.trim(); if (manualValue) branchModeBranches.push(manualValue); }
+      if (missingRepo.length) toast("这些代码源未识别到仓库地址，本次运行将使用流水线默认分支：" + missingRepo.join("、"), true);
+      var submit = event.currentTarget; submit.disabled = true;
+      rpc("pipeline.run.create", rpcArgs({ pipelineId: pipeline.id, branchModeBranches: branchModeBranches, runningBranches: runningBranches, comment: commentInput.value })).then(function (result) {
+        dialog.close(); toast("流水线已开始运行，实例 #" + result.pipelineRunId); loadPipelines();
+      }).catch(function (error) { toast(error.message, true); }).finally(function () { submit.disabled = false; });
+    }
+    dialog.foot.textContent = ""; dialog.foot.append(button("取消", "", dialog.close), button("确认运行", "primary", confirmRun));
     rpc("pipeline.branches", rpcArgs({ pipelineId: pipeline.id })).then(function (sources) {
-      dialog.body.textContent = "";
-      var form = node("div", "dyx-form");
-      var sourceFields = [];
+      statusNote.remove();
       (sources || []).forEach(function (source) {
         var branches = Array.from(new Set([source.defaultBranch].concat(source.branches || []).filter(Boolean)));
         var datalist = node("datalist");
         datalist.id = "dyx-branch-list-" + (++branchDatalistSeq);
         branches.forEach(function (branch) { var option = node("option", "", branch); option.value = branch; datalist.append(option); });
-        form.append(datalist);
+        form.insertBefore(datalist, commentField);
         var control;
+        var sourceField;
         if (source.isBranchMode && branches.length) {
           control = node("select", "dyx-select");
           control.multiple = true;
           control.size = Math.min(5, Math.max(3, branches.length));
           branches.forEach(function (branch) { var option = node("option", "", branch); option.value = branch; option.selected = branch === source.defaultBranch; control.append(option); });
           control.setAttribute("aria-label", source.name + "运行分支");
-          form.append(field(source.name + " · 运行分支（可多选）", control));
+          sourceField = field(source.name + " · 运行分支（可多选）", control);
+          form.insertBefore(sourceField, commentField);
           var customInput = input("text", "列表里没有？手动输入分支名称", "");
           customInput.setAttribute("list", datalist.id);
           var addButton = button("添加分支", "", function () {
@@ -1754,43 +2246,23 @@ function createWorkspace(onRequestClose, notifier, services) {
           });
           var customRow = node("div", "dyx-status-row");
           customRow.append(field("手动添加分支", customInput), addButton);
-          form.append(customRow);
+          form.insertBefore(customRow, commentField);
         } else {
           control = input("text", "留空使用流水线默认分支", source.defaultBranch || "");
           control.setAttribute("list", datalist.id);
           control.setAttribute("aria-label", source.name + "运行分支");
-          form.append(field(source.name + (source.isBranchMode ? " · 运行分支（手动输入）" : " · 运行分支"), control));
+          sourceField = field(source.name + (source.isBranchMode ? " · 运行分支（手动输入）" : " · 运行分支"), control);
+          form.insertBefore(sourceField, commentField);
         }
-        if (source.warning) form.append(node("div", "dyx-note", source.warning));
+        if (source.warning) form.insertBefore(node("div", "dyx-note", source.warning), commentField);
         sourceFields.push({ source: source, control: control });
       });
-      if (!sourceFields.length) form.append(empty("没有可配置的代码源", "将使用流水线默认配置运行。"));
-      var commentInput = input("textarea", "可选，填写本次运行备注");
-      form.append(field("运行备注", commentInput)); dialog.body.append(form);
-      dialog.foot.textContent = ""; dialog.foot.append(button("取消", "", dialog.close), button("确认运行", "primary", function (event) {
-        var runningBranches = {}; var branchModeBranches = []; var missingRepo = [];
-        sourceFields.forEach(function (entry) {
-          if (entry.source.isBranchMode) {
-            if (entry.control.multiple) {
-              Array.from(entry.control.selectedOptions).forEach(function (option) { var value = option.value.trim(); if (value) branchModeBranches.push(value); });
-            } else {
-              var manual = entry.control.value.trim();
-              if (manual) branchModeBranches.push(manual);
-            }
-            return;
-          }
-          var value = entry.control.value.trim();
-          if (!value) return;
-          if (entry.source.repo) runningBranches[entry.source.repo] = value;
-          else missingRepo.push(entry.source.name || "代码源");
-        });
-        if (missingRepo.length) toast("这些代码源未识别到仓库地址，本次运行将使用流水线默认分支：" + missingRepo.join("、"), true);
-        var submit = event.currentTarget; submit.disabled = true;
-        rpc("pipeline.run.create", rpcArgs({ pipelineId: pipeline.id, branchModeBranches: branchModeBranches, runningBranches: runningBranches, comment: commentInput.value })).then(function (result) {
-          dialog.close(); toast("流水线已开始运行，实例 #" + result.pipelineRunId); loadPipelines();
-        }).catch(function (error) { toast(error.message, true); }).finally(function () { submit.disabled = false; });
-      }));
-    }).catch(function (error) { dialog.body.textContent = ""; dialog.body.append(empty("代码源读取失败", error.message)); });
+      if (!sourceFields.length) form.insertBefore(empty("没有可配置的代码源", "将使用流水线默认配置运行。"), commentField);
+    }).catch(function (error) {
+      statusNote.textContent = "代码源与分支读取失败：" + error.message + "。可直接用流水线默认配置运行，或在下方手动填写分支。";
+      manualBranchInput = input("text", "留空使用流水线默认分支", "");
+      form.insertBefore(field("运行分支（手动输入，可选）", manualBranchInput), commentField);
+    });
   }
 
   function openPipelineRun(pipeline, run) {
@@ -1836,6 +2308,1459 @@ function createWorkspace(onRequestClose, notifier, services) {
     stages.forEach(function (item) { visit(item, 0); }); return result;
   }
 
+  // —— 概览：聚合待办与各域状态，作为打开工作台的默认落点 ——————————————————
+  function loadDashboard() {
+    if (!selectedProject()) { state.dashboard.loaded = true; render(); return; }
+    var refresh = Promise.all([
+      rpc("defect.notification.scan", rpcArgs({})).catch(function () { return null; }),
+      rpc("pipelines.list", rpcArgs({ page: 1, pageSize: 20 })).catch(function () { return null; }),
+      loadFlows().catch(function () { return null; })
+    ]).then(function (values) {
+      state.dashboard = { loaded: true, scan: values[0], pipelines: values[1] };
+      render();
+    });
+    return refresh;
+  }
+
+  function renderDashboard() {
+    var section = node("section", "dyx-section");
+    var account = selectedAccount();
+    var project = selectedProject();
+    var title = node("div", "dyx-title");
+    var copy = node("div");
+    copy.append(node("h2", "", "概览"), node("p", "", account && project ? account.name + " · " + project.name : "配置账号与项目后，这里会聚合待办与各域状态。"));
+    title.append(copy, button("刷新", "", loadDashboard));
+    section.append(title);
+
+    var pending = state.dashboard.scan && Array.isArray(state.dashboard.scan.items) ? state.dashboard.scan.items : [];
+    var pipelineItems = state.dashboard.pipelines && state.dashboard.pipelines.items || [];
+    var pipelineTotal = state.dashboard.pipelines && state.dashboard.pipelines.total || pipelineItems.length;
+    var failedPipelines = pipelineItems.filter(function (item) { return statusClass(item.status) === "fail"; }).length;
+    var runningPipelines = pipelineItems.filter(function (item) { return statusClass(item.status) === "run"; }).length;
+    var flowsEnabled = state.flows.items.filter(function (item) { return item.on; }).length;
+    var binding = account && account.workspace || null;
+    // 统计条：与各列表页同款固定宽度方格小卡，点击直达对应页签。
+    var strip = node("div", "dyx-statstrip");
+    strip.append(
+      statTile({ label: "待处理缺陷", tone: pending.length ? "pending" : "", value: pending.length, hint: pending.length ? "待确认 / 再次打开" : "通知未开启或读取失败", onClick: function () { setTab("defects"); } }),
+      statTile({ label: "全部流水线", value: pipelineTotal, hint: "读取 " + pipelineItems.length + " 条", onClick: function () { setTab("pipelines"); } }),
+      statTile({ label: "运行中", tone: "run", value: runningPipelines, hint: "流水线", onClick: function () { setTab("pipelines"); } }),
+      statTile({ label: "最近失败", tone: failedPipelines ? "fail" : "", value: failedPipelines, hint: failedPipelines ? "可交给自愈编排" : "暂无失败运行", onClick: function () { setTab("pipelines"); } }),
+      statTile({ label: "启用的编排", tone: flowsEnabled ? "ok" : "", value: flowsEnabled, hint: state.flows.items.length ? "共 " + state.flows.items.length + " 条流程" : "还没有编排", onClick: function () { setTab("flows"); } }),
+      statTile({ label: "DSH 工作区", tone: binding ? "ok" : "", value: binding ? "已绑定" : "未绑定", hint: binding ? (binding.title || binding.id) : "绑定后可一键处理缺陷", onClick: function () { setTab("overview"); } })
+    );
+    section.append(strip);
+
+    if (pending.length) {
+      var card = node("div", "dyx-card");
+      var head = node("div", "dyx-card-head");
+      var headCopy = node("div", "dyx-card-title");
+      headCopy.append(node("h3", "", "待处理缺陷"), node("small", "", "来自缺陷通知的最新检查 · 共 " + pending.length + " 条"));
+      head.append(headCopy, button("查看全部", "", function () { setTab("defects"); }));
+      card.append(head);
+      // 直接复用工作项页的方格卡片（状态下拉、负责人、标签与草稿/处理按钮），两页观感一致。
+      card.append(defectTable(pending.slice(0, DASHBOARD_PREVIEW_LIMIT)));
+      section.append(card);
+    }
+
+    var flowCard = node("div", "dyx-card");
+    var flowHead = node("div", "dyx-card-head");
+    var flowCopy = node("div", "dyx-card-title");
+    flowCopy.append(node("h3", "", "流程编排"), node("small", "", state.flows.items.length ? "共 " + state.flows.items.length + " 条 · " + flowsEnabled + " 条已启用" : "从模板一键创建"));
+    flowHead.append(flowCopy, button("进入画布", "primary", function () { setTab("flows"); }));
+    flowCard.append(flowHead);
+    if (!state.flows.items.length) flowCard.append(empty("还没有编排", "从模板一键创建：缺陷自动修复、流水线失败自愈等。"));
+    else flowCard.append(flowGrid(state.flows.items.slice(0, DASHBOARD_PREVIEW_LIMIT)));
+    section.append(flowCard);
+    main.append(section);
+  }
+
+  // 概览里的编排卡片：启用状态着左轨，最近一次运行结果作徽章；点击直接打开该编排的画布。
+  function flowGrid(items) {
+    var wrap = node("div", "dyx-record-list dyx-tile-grid");
+    items.forEach(function (flow) {
+      var lastRun = flow.runs && flow.runs[0];
+      var runKind = !lastRun ? "" : lastRun.status === "成功" ? "ok" : lastRun.status === "失败" ? "fail" : "run";
+      var card = node("article", "dyx-record dyx-record-clickable dyx-tile-card" + (flow.on ? " tone-ok" : ""));
+      function openFlow() {
+        var index = state.flows.items.indexOf(flow);
+        if (index >= 0) { state.flows.active = index; state.flows.sel = ""; state.flows.selEdge = -1; }
+        setTab("flows");
+      }
+      card.addEventListener("click", function (event) {
+        if (event.target.closest("button")) return;
+        openFlow();
+      });
+      var head = node("div", "dyx-record-head");
+      head.append(node("span", "dyx-badge " + (flow.on ? "ok" : ""), flow.on ? "已启用" : "未启用"), node("span", "dyx-badge " + runKind, lastRun ? lastRun.status : "未运行过"));
+      var title = node("button", "dyx-link dyx-record-title", flow.name || "未命名编排");
+      title.type = "button";
+      title.title = flow.name || "未命名编排";
+      title.addEventListener("click", openFlow);
+      var meta = node("div", "dyx-record-meta");
+      meta.append(node("span", "", (flow.nodes || []).length + " 个节点"));
+      if (flow.trg) meta.append(node("span", "", "触发：" + flow.trg));
+      if (flow.autoRun) meta.append(node("span", "", "缺陷自动触发"));
+      var foot = node("div", "dyx-record-foot");
+      var when = node("span", "dyx-muted", lastRun ? "最近运行 " + shortDateTime(lastRun.startedAt) : "尚未运行");
+      if (lastRun) when.title = formatDate(lastRun.startedAt);
+      var actions = node("div", "dyx-actions");
+      actions.append(button("打开", "", openFlow));
+      foot.append(when, actions);
+      card.append(head, title, meta, foot);
+      wrap.append(card);
+    });
+    return wrap;
+  }
+
+  // —— 代码 Codeup：仓库列表 + 分支 / 合并请求 ————————————————————————————
+  function loadCodeRepos() {
+    if (!selectedProject()) { state.code.loaded = true; render(); return; }
+    return rpc("code.repos.list", rpcArgs({ page: state.code.page, pageSize: state.code.pageSize, search: state.code.keyword })).then(function (result) {
+      state.code.repos = result.items || [];
+      state.code.total = result.total || state.code.repos.length;
+      state.code.page = result.page || state.code.page;
+      state.code.pageSize = result.pageSize || state.code.pageSize;
+      state.code.loaded = true;
+      state.code.stale = Boolean(result.stale);
+      state.code.cachedAt = result.cachedAt;
+      render();
+      if (result.stale) toast("代码库读取失败，展示缓存：" + (result.warning || ""), true);
+    }).catch(function (error) {
+      state.code.repos = [];
+      state.code.loaded = true;
+      state.code.error = error.message;
+      render();
+    });
+  }
+
+  function renderCode() {
+    var section = node("section", "dyx-section");
+    var title = node("div", "dyx-title");
+    var copy = node("div");
+    copy.append(node("h2", "", "代码"), node("p", "", "组织内的 Codeup 仓库；分支与合并请求按仓库查看，检测有严重问题的 MR 建议先修复再合入。"));
+    title.append(copy, button("刷新", "", function () { state.code.loaded = false; loadCodeRepos(); }));
+    section.append(title);
+    if (!renderRequirement(section)) { main.append(section); return; }
+    var items = state.code.repos || [];
+    // 统计条：总数取服务端，活跃度计数来自当前页（按最近一次活动时间分段）。
+    var weekMs = 7 * 24 * 3600 * 1000, monthMs = 30 * 24 * 3600 * 1000, now = Date.now();
+    var activeWeek = 0, activeMonth = 0, idle = 0;
+    items.forEach(function (repo) {
+      var ts = dateValue(repo.lastActivityAt);
+      if (!ts) idle++;
+      else if (now - ts <= weekMs) activeWeek++;
+      else if (now - ts <= monthMs) activeMonth++;
+      else idle++;
+    });
+    var strip = node("div", "dyx-statstrip");
+    strip.append(
+      statTile({ label: "全部代码库", value: state.code.total || items.length, hint: "本页 " + items.length + " 条" }),
+      statTile({ label: "7 天内活跃", tone: "ok", value: activeWeek, hint: "本页计数" }),
+      statTile({ label: "30 天内活跃", value: activeMonth, hint: "本页计数" }),
+      statTile({ label: "长期未活跃", tone: "fail", value: idle, hint: "本页计数" })
+    );
+    var card = node("div", "dyx-card");
+    if (!state.code.loaded) card.append(empty("正在读取代码库", ""));
+    else if (state.code.error) card.append(empty("代码库读取失败", state.code.error + "。请确认令牌具有“代码管理 → 只读”权限。"));
+    else {
+      var keyword = input("text", "仓库名称或路径", state.code.keyword);
+      // 输入框内直接回车即查询，与流水线页一致。
+      keyword.setAttribute("aria-label", "按名称搜索代码库");
+      keyword.addEventListener("keydown", function (event) {
+        if (event.key === "Enter") { state.code.keyword = keyword.value.trim(); state.code.page = 1; loadCodeRepos(); }
+      });
+      function onRepoPage(next) { state.code.page = next; loadCodeRepos(); }
+      function searchRepos() { state.code.keyword = keyword.value.trim(); state.code.page = 1; loadCodeRepos(); }
+      function clearRepos() {
+        if (!state.code.keyword && !keyword.value) return;
+        state.code.keyword = ""; keyword.value = ""; state.code.page = 1; loadCodeRepos();
+      }
+      var filters = node("div", "dyx-pipeline-filters");
+      filters.append(field("关键词", keyword), button("查询", "primary", searchRepos), button("清空", "", clearRepos));
+      var toolbar = node("div", "dyx-list-toolbar");
+      toolbar.append(filters, pager(state.code, onRepoPage));
+      card.append(toolbar);
+      if (state.code.stale) card.append(node("div", "dyx-stale", "云效暂时不可用，当前为 " + formatDate(state.code.cachedAt) + " 的缓存。"));
+      if (!items.length) card.append(empty("暂无代码库", "当前令牌可见的组织内 Codeup 仓库会显示在这里。"));
+      else card.append(repoGrid(items));
+      card.append(pager(state.code, onRepoPage));
+    }
+    section.append(strip, card);
+    main.append(section);
+  }
+
+  function repoGrid(items) {
+    var wrap = node("div", "dyx-record-list dyx-tile-grid");
+    items.forEach(function (repo) {
+      var card = node("article", "dyx-record dyx-record-clickable dyx-tile-card");
+      // 整卡点击打开仓库详情；按钮区域保持自身行为，不冒泡重复触发。
+      card.addEventListener("click", function (event) {
+        if (event.target.closest("button")) return;
+        openRepoDetail(repo);
+      });
+      var head = node("div", "dyx-record-head");
+      head.append(node("span", "dyx-badge", repo.defaultBranch || "默认分支 -"));
+      var title = node("button", "dyx-link dyx-record-title", repo.name || repo.path);
+      title.type = "button";
+      title.title = repo.name || repo.path;
+      title.addEventListener("click", function () { openRepoDetail(repo); });
+      var meta = node("div", "dyx-record-meta");
+      meta.append(node("span", "", repo.path || repo.id));
+      if (repo.description) meta.append(node("span", "", repo.description));
+      var foot = node("div", "dyx-record-foot");
+      var updated = node("span", "dyx-muted", "活跃 " + shortDateTime(repo.lastActivityAt));
+      updated.title = "活跃 " + formatDate(repo.lastActivityAt);
+      var actions = node("div", "dyx-actions");
+      actions.append(button("打开", "", function () { openRepoDetail(repo); }));
+      foot.append(updated, actions);
+      card.append(head, title, foot);
+      wrap.append(card);
+    });
+    return wrap;
+  }
+
+  function openRepoDetail(repo) {
+    var dialog = modal("代码库：" + (repo.name || repo.path), true);
+    dialog.body.append(empty("正在读取", "分支与合并请求"));
+    var tabs = node("div", "dyx-nav");
+    var body = node("div");
+    var current = "mr";
+    function renderTab(name) {
+      current = name;
+      Array.from(tabs.children).forEach(function (buttonEl) { buttonEl.classList.toggle("active", buttonEl.dataset.tab === name); });
+      body.textContent = "";
+      if (name === "branches") renderRepoBranches(dialog, repo, body);
+      else renderRepoMrs(dialog, repo, body);
+    }
+    var mrTab = node("button", "active", "合并请求"); mrTab.type = "button"; mrTab.dataset.tab = "mr";
+    var brTab = node("button", "", "分支"); brTab.type = "button"; brTab.dataset.tab = "branches";
+    mrTab.addEventListener("click", function () { renderTab("mr"); });
+    brTab.addEventListener("click", function () { renderTab("branches"); });
+    tabs.append(mrTab, brTab);
+    dialog.body.append(tabs, body);
+    renderTab("mr");
+    dialog.foot.textContent = "";
+    dialog.foot.append(button("关闭", "", dialog.close));
+  }
+
+  function renderRepoBranches(dialog, repo, body) {
+    body.textContent = "";
+    body.append(empty("正在读取分支", ""));
+    rpc("code.branches.list", rpcArgs({ repositoryId: repo.path || repo.id })).then(function (result) {
+      body.textContent = "";
+      if (result.warning) body.append(node("div", "dyx-note", result.warning));
+      var branches = result.items || [];
+      if (!branches.length) { body.append(empty("暂无分支", "")); return; }
+      var list = node("div", "dyx-record-list");
+      branches.slice(0, 100).forEach(function (name) {
+        var row = node("article", "dyx-record");
+        var head = node("div", "dyx-record-head");
+        head.append(node("strong", "", name));
+        if (name === repo.defaultBranch) head.append(node("span", "dyx-badge ok", "默认"));
+        list.append(row.append(head));
+      });
+      body.append(list);
+    }).catch(function (error) {
+      body.textContent = "";
+      body.append(empty("分支读取失败", error.message));
+    });
+  }
+
+  function renderRepoMrs(dialog, repo, body) {
+    body.textContent = "";
+    body.append(empty("正在读取合并请求", ""));
+    rpc("code.mrs.list", rpcArgs({ repositoryId: repo.path || repo.id, state: "opened" })).then(function (result) {
+      body.textContent = "";
+      if (result.stale) body.append(node("div", "dyx-stale", "合并请求读取失败，展示 " + formatDate(result.cachedAt) + " 的缓存。"));
+      var items = result.items || [];
+      if (!items.length) { body.append(empty("没有进行中的合并请求", "")); return; }
+      var list = node("div", "dyx-record-list");
+      items.forEach(function (mr) {
+        var row = node("article", "dyx-record");
+        var head = node("div", "dyx-record-head");
+        head.append(node("strong", "", "!" + mr.id + " " + mr.title), node("span", "dyx-badge " + (mr.state === "opened" ? "run" : ""), mr.state || "-"));
+        var meta = node("div", "dyx-record-meta");
+        meta.append(node("span", "", (mr.sourceBranch || "?") + " → " + (mr.targetBranch || "?")));
+        if (mr.authorName) meta.append(node("span", "", mr.authorName));
+        var foot = node("div", "dyx-record-foot");
+        var actions = node("div", "dyx-actions");
+        actions.append(button("在云效中打开", "dyx-btn-sm", function () { toast("请在云效代码库页面处理该合并请求"); }));
+        if (mr.state === "opened") {
+          actions.append(button("合入 " + (mr.targetBranch || ""), "dyx-btn-sm primary", function () {
+            if (!window.confirm("确认将 \"" + mr.title + "\" 合入 " + (mr.targetBranch || "目标分支") + "？")) return;
+            setBusy(dialog.body, true);
+            rpc("code.mr.merge", rpcArgs({ repositoryId: repo.path || repo.id, mergeRequestId: mr.id })).then(function () {
+              toast("合并请求 !" + mr.id + " 已合入");
+              dialog.close();
+            }).catch(function (error) {
+              toast(error.message + "。可到云效页面手动合入。", true);
+            }).finally(function () { setBusy(dialog.body, false); });
+          }));
+        }
+        foot.append(node("span", "dyx-muted", formatDate(mr.createdAt || mr.updatedAt)), actions);
+        row.append(head, meta, foot);
+        list.append(row);
+      });
+      body.append(list);
+    }).catch(function (error) {
+      body.textContent = "";
+      body.append(empty("合并请求读取失败", error.message + "。当前组织的 Codeup 接口可能未开放该能力。"));
+    });
+  }
+
+  // —— 测试管理 / 制品仓库 ————————————————————————————————————————————
+  function loadTestPlans() {
+    if (!selectedProject()) { state.tests.loaded = true; render(); return; }
+    return rpc("tests.plans.list", rpcArgs({ page: state.tests.page, pageSize: state.tests.pageSize })).then(function (result) {
+      state.tests.plans = result.items || [];
+      state.tests.total = result.total || state.tests.plans.length;
+      state.tests.page = result.page || state.tests.page;
+      state.tests.pageSize = result.pageSize || state.tests.pageSize;
+      state.tests.loaded = true;
+      state.tests.stale = Boolean(result.stale);
+      state.tests.cachedAt = result.cachedAt;
+      render();
+    }).catch(function (error) {
+      state.tests.plans = [];
+      state.tests.loaded = true;
+      state.tests.error = error.message;
+      render();
+    });
+  }
+
+  function renderTests() {
+    var section = node("section", "dyx-section");
+    var title = node("div", "dyx-title");
+    var copy = node("div");
+    copy.append(node("h2", "", "测试"), node("p", "", "组织内可见的测试计划与用例通过情况；编排里的测试卡点可按通过率决定是否继续。"));
+    title.append(copy, button("刷新", "", function () { state.tests.loaded = false; loadTestPlans(); }));
+    section.append(title);
+    if (!renderRequirement(section)) { main.append(section); return; }
+    var items = state.tests.plans || [];
+    // 统计条：总数取服务端，状态计数来自当前页。
+    var running = 0, done = 0, other = 0;
+    items.forEach(function (plan) {
+      var normalized = String(plan.status || "").trim();
+      if (normalized === "进行中") running++;
+      else if (normalized && normalized !== "-") done++;
+      else other++;
+    });
+    var strip = node("div", "dyx-statstrip");
+    strip.append(
+      statTile({ label: "全部计划", value: state.tests.total || items.length, hint: "本页 " + items.length + " 条" }),
+      statTile({ label: "进行中", tone: "run", value: running, hint: "本页计数" }),
+      statTile({ label: "已完成", tone: "ok", value: done, hint: "本页计数" }),
+      statTile({ label: "其他状态", value: other, hint: "本页计数" })
+    );
+    var card = node("div", "dyx-card");
+    if (!state.tests.loaded) card.append(empty("正在读取测试计划", ""));
+    else if (state.tests.error) card.append(empty("测试计划读取失败", state.tests.error + "。请检查个人访问令牌是否勾选「测试管理」读权限后重试。"));
+    else {
+      function onPlanPage(next) { state.tests.page = next; loadTestPlans(); }
+      var toolbar = node("div", "dyx-list-toolbar");
+      toolbar.append(node("div"), pager(state.tests, onPlanPage));
+      card.append(toolbar);
+      if (state.tests.stale) card.append(node("div", "dyx-stale", "云效暂时不可用，当前为 " + formatDate(state.tests.cachedAt) + " 的缓存。"));
+      if (!items.length) card.append(empty("暂无测试计划", ""));
+      else card.append(planGrid(items));
+      card.append(pager(state.tests, onPlanPage));
+    }
+    section.append(strip, card);
+    main.append(section);
+  }
+
+  // 测试计划方格卡片：进行中/已完成用左轨着色，通过率进度条占满卡片底部。
+  function planGrid(items) {
+    var wrap = node("div", "dyx-record-list dyx-tile-grid");
+    items.forEach(function (plan) {
+      var kind = String(plan.status || "").trim() === "进行中" ? "run" : "ok";
+      var card = node("article", "dyx-record dyx-tile-card tone-" + kind);
+      var head = node("div", "dyx-record-head");
+      head.append(node("span", "dyx-badge", plan.id ? "#" + plan.id : "测试计划"), node("span", "dyx-badge " + kind, plan.status || "-"));
+      var title = node("div", "dyx-record-title", plan.name || "未命名测试计划");
+      title.title = plan.name || "未命名测试计划";
+      var total = plan.caseTotal || 0;
+      var passed = plan.casePassed || 0;
+      var rate = total ? Math.round((passed / total) * 100) : null;
+      var meta = node("div", "dyx-record-meta");
+      meta.append(node("span", "", total ? passed + "/" + total + " 用例通过" : "用例数未知"));
+      if (plan.caseFailed) meta.append(node("span", "", "失败 " + plan.caseFailed));
+      if (plan.ownerName) meta.append(node("span", "", plan.ownerName));
+      var progress = node("div", "dyx-pbar");
+      var fill = node("i");
+      fill.style.width = (rate === null ? 0 : rate) + "%";
+      fill.style.background = rate !== null && rate < 90 ? "var(--dyx-warn)" : "var(--dyx-ok)";
+      progress.append(fill);
+      var foot = node("div", "dyx-record-foot");
+      foot.append(progress, node("span", "dyx-muted", rate === null ? "通过率 -" : "通过率 " + rate + "% · 卡点 90%"));
+      card.append(head, title, meta, foot);
+      wrap.append(card);
+    });
+    return wrap;
+  }
+
+  function loadPackageRepos() {
+    if (!selectedProject()) { state.packages.loaded = true; render(); return; }
+    return rpc("packages.repos.list", rpcArgs({ page: state.packages.page, pageSize: state.packages.pageSize })).then(function (result) {
+      state.packages.repos = result.items || [];
+      state.packages.total = result.total || state.packages.repos.length;
+      state.packages.page = result.page || state.packages.page;
+      state.packages.pageSize = result.pageSize || state.packages.pageSize;
+      state.packages.loaded = true;
+      state.packages.stale = Boolean(result.stale);
+      state.packages.cachedAt = result.cachedAt;
+      render();
+    }).catch(function (error) {
+      state.packages.repos = [];
+      state.packages.loaded = true;
+      state.packages.error = error.message;
+      render();
+    });
+  }
+
+  // 制品库类型粗分：语言包 / 镜像与 Charts / 其他，用于统计条计数。
+  function packageRepoKind(type) {
+    var normalized = String(type || "").trim().toUpperCase();
+    if (["MAVEN", "NPM", "PYPI", "NUGET", "COMPOSER", "GO", "GOLANG", "CARGO", "CONAN", "GEM", "HEX", "COCOAPODS"].indexOf(normalized) >= 0) return "lang";
+    if (["DOCKER", "OCI", "HELM", "CHART", "IMAGE"].indexOf(normalized) >= 0) return "image";
+    return "other";
+  }
+
+  function renderPackages() {
+    var section = node("section", "dyx-section");
+    var title = node("div", "dyx-title");
+    var copy = node("div");
+    copy.append(node("h2", "", "制品"), node("p", "", "组织内的制品仓库；制品版本仍以云效页面为准，这里的列表用于快速确认仓库可用性。"));
+    title.append(copy, button("刷新", "", function () { state.packages.loaded = false; loadPackageRepos(); }));
+    section.append(title);
+    if (!renderRequirement(section)) { main.append(section); return; }
+    var items = state.packages.repos || [];
+    // 统计条：总数取服务端，类型计数来自当前页。
+    var lang = 0, image = 0, other = 0;
+    items.forEach(function (repo) {
+      var kind = packageRepoKind(repo.type);
+      if (kind === "lang") lang++;
+      else if (kind === "image") image++;
+      else other++;
+    });
+    var strip = node("div", "dyx-statstrip");
+    strip.append(
+      statTile({ label: "全部制品库", value: state.packages.total || items.length, hint: "本页 " + items.length + " 条" }),
+      statTile({ label: "语言包", tone: "ok", value: lang, hint: "本页计数" }),
+      statTile({ label: "镜像与 Charts", tone: "run", value: image, hint: "本页计数" }),
+      statTile({ label: "其他类型", value: other, hint: "本页计数" })
+    );
+    var card = node("div", "dyx-card");
+    if (!state.packages.loaded) card.append(empty("正在读取制品仓库", ""));
+    else if (state.packages.error) card.append(empty("制品仓库读取失败", state.packages.error + "。当前组织的制品 OpenAPI 可能未开放。"));
+    else {
+      function onPackagePage(next) { state.packages.page = next; loadPackageRepos(); }
+      var toolbar = node("div", "dyx-list-toolbar");
+      toolbar.append(node("div"), pager(state.packages, onPackagePage));
+      card.append(toolbar);
+      if (state.packages.stale) card.append(node("div", "dyx-stale", "云效暂时不可用，当前为 " + formatDate(state.packages.cachedAt) + " 的缓存。"));
+      if (!items.length) card.append(empty("暂无制品仓库", ""));
+      else card.append(packageGrid(items));
+      card.append(pager(state.packages, onPackagePage));
+    }
+    section.append(strip, card);
+    main.append(section);
+  }
+
+  function packageGrid(items) {
+    var wrap = node("div", "dyx-record-list dyx-tile-grid");
+    items.forEach(function (repo) {
+      var kind = packageRepoKind(repo.type);
+      var tone = kind === "lang" ? " tone-ok" : kind === "image" ? " tone-run" : "";
+      var card = node("article", "dyx-record dyx-tile-card" + tone);
+      var head = node("div", "dyx-record-head");
+      head.append(node("span", "dyx-badge", repo.type || "制品库"));
+      var title = node("div", "dyx-record-title", repo.name || "未命名制品库");
+      title.title = repo.name || "未命名制品库";
+      var meta = node("div", "dyx-record-meta");
+      if (repo.description) meta.append(node("span", "", repo.description));
+      var foot = node("div", "dyx-record-foot");
+      foot.append(node("span", "dyx-muted", repo.createdAt ? "创建于 " + formatDate(repo.createdAt) : ""));
+      card.append(head, title, meta, foot);
+      wrap.append(card);
+    });
+    return wrap;
+  }
+
+  // —— 流程编排：画布 + 客户端运行引擎 ——————————————————————————————————
+  // 画布定义持久化在数据文件（flows.*）；运行由客户端驱动，动作直接复用
+  // 已有能力：DSH 会话、工作项更新、评论、系统通知、流水线运行。
+  // MR / 代码检测 / 测试计划 / 部署暂作为人工检查点（等待确认后继续）。
+  function activeFlow() {
+    return state.flows.items[state.flows.active] || null;
+  }
+
+  function loadFlows() {
+    return rpc("flows.list", {}).then(function (result) {
+      state.flows.items = (result.items || []).map(hydrateFlow);
+      state.flows.loaded = true;
+      if (state.flows.active >= state.flows.items.length) state.flows.active = 0;
+      if (state.tab === "flows" || state.tab === "dashboard") render();
+      return state.flows.items;
+    });
+  }
+
+  function saveFlowSoon() {
+    if (saveFlowSoon.timer) clearTimeout(saveFlowSoon.timer);
+    saveFlowSoon.timer = setTimeout(function () {
+      saveFlowSoon.timer = null;
+      var flow = activeFlow();
+      if (!flow || !flow.id) return;
+      rpc("flows.save", { flow: flow }).catch(function (error) { toast("编排保存失败：" + error.message, true); });
+    }, 400);
+  }
+
+  function renderFlows() {
+    var section = node("section", "dyx-section dyx-flow-section");
+    var flow = activeFlow();
+    var title = node("div", "dyx-title");
+    var copy = node("div");
+    copy.append(node("h2", "", "编排"), node("p", "", "把云效事件、DSH 智能体与流水线/工作项/通知串成一条流；拖拽节点连线，运行时按连线逐步执行。"));
+    title.append(copy);
+    var titleActions = node("div", "dyx-actions");
+    var selector = node("select", "dyx-select");
+    selector.setAttribute("aria-label", "选择编排");
+    if (!state.flows.items.length) {
+      var placeholder = node("option", "", "暂无编排");
+      selector.append(placeholder);
+    } else {
+      state.flows.items.forEach(function (item, index) {
+        var option = node("option", "", item.name);
+        option.value = String(index);
+        if (index === state.flows.active) option.selected = true;
+        selector.append(option);
+      });
+    }
+    selector.addEventListener("change", function () {
+      state.flows.active = Number(selector.value) || 0;
+      state.flows.sel = "";
+      state.flows.selEdge = -1;
+      render();
+    });
+    titleActions.append(selector);
+    if (flow) {
+      var enableToggle = input("checkbox");
+      enableToggle.checked = Boolean(flow.on);
+      enableToggle.setAttribute("aria-label", "启用编排");
+      var enableWrap = node("label", "dyx-notify-toggle dyx-flow-enable");
+      var enableCopy = node("span");
+      enableCopy.append(node("strong", "", "启用"));
+      enableWrap.append(enableCopy, enableToggle);
+      enableToggle.addEventListener("change", function () {
+        flow.on = enableToggle.checked;
+        saveFlowSoon();
+      });
+      var autoToggle = input("checkbox");
+      autoToggle.checked = Boolean(flow.autoRun);
+      autoToggle.setAttribute("aria-label", "缺陷新增时自动运行");
+      var autoWrap = node("label", "dyx-notify-toggle dyx-flow-enable");
+      var autoCopy = node("span");
+      autoCopy.append(node("strong", "", "缺陷自动触发"));
+      autoWrap.append(autoCopy, autoToggle);
+      autoToggle.addEventListener("change", function () {
+        flow.autoRun = autoToggle.checked;
+        saveFlowSoon();
+        toast(flow.autoRun ? "新增待处理缺陷时将自动运行该编排" : "已关闭自动触发");
+      });
+      titleActions.append(enableWrap, autoWrap);
+      titleActions.append(button("模板重建", "", function () {
+        if (!window.confirm("用同名模板重建当前编排？当前画布会被覆盖。")) return;
+        var template = FLOW_DEFAULT_TEMPLATES.find(function (item) { return item.name === flow.name; });
+        var rebuilt = template
+          ? hydrateFlow(Object.assign({}, template, { id: flow.id, name: flow.name, on: flow.on, autoRun: flow.autoRun, runs: flow.runs }))
+          : hydrateFlow(Object.assign({}, FLOW_DEFAULT_TEMPLATES[2], { id: flow.id, name: flow.name, on: flow.on, autoRun: flow.autoRun, runs: flow.runs }));
+        Object.assign(flow, rebuilt);
+        state.flows.run = null;
+        saveFlowSoon();
+        render();
+      }));
+      titleActions.append(button("新建编排", "", function () {
+        var template = hydrateFlow(Object.assign({}, FLOW_DEFAULT_TEMPLATES[2], { id: newFlowId(), name: "编排 " + (state.flows.items.length + 1) }));
+        state.flows.items.unshift(template);
+        state.flows.active = 0;
+        state.flows.run = null;
+        saveFlowSoon();
+        render();
+      }));
+      titleActions.append(button("删除编排", "danger", function () {
+        if (!window.confirm("删除编排\"" + flow.name + "\"及其运行记录？")) return;
+        var removing = flow;
+        rpc("flows.delete", { flowId: flow.id }).catch(function () {}).then(function () {
+          var index = state.flows.items.indexOf(removing);
+          if (index >= 0) state.flows.items.splice(index, 1);
+          state.flows.active = 0;
+          state.flows.run = null;
+          if (state.flows.items.length) return rpc("flows.save", { flow: activeFlow() }).catch(function () {});
+        }).then(function () { render(); toast("编排已删除"); });
+      }));
+      titleActions.append(button("运行记录", "", function () { openFlowRuns(flow); }));
+      titleActions.append(button("运行", "primary", function () { startFlowRun(flow, null); }));
+    }
+    title.append(titleActions);
+    section.append(title);
+    if (!renderRequirement(section)) { main.append(section); return; }
+    if (!flow) {
+      var starter = node("div", "dyx-card");
+      starter.append(empty("还没有编排", "从模板开始：把缺陷自动修复、流水线失败自愈串成一条流。"));
+      FLOW_DEFAULT_TEMPLATES.slice(0, 2).forEach(function (template) {
+        starter.append(button("从模板创建：" + template.name, "primary", function () {
+          var created = hydrateFlow(Object.assign({}, template, { id: newFlowId() }));
+          state.flows.items.unshift(created);
+          state.flows.active = 0;
+          saveFlowSoon();
+          render();
+        }));
+      });
+      section.append(starter);
+      main.append(section);
+      return;
+    }
+    section.append(renderFlowShell(flow));
+    main.append(section);
+    bindFlowCanvas();
+    drawFlowEdges();
+    renderFlowStates();
+  }
+
+  function flowNodeEl(node, selected) {
+    var type = FLOW_NODE_TYPES[node.tp];
+    var element = node2("div", "dyx-flow-node" + (selected ? " selected" : ""));
+    element.dataset.nid = node.id;
+    element.style.left = node.x + "px";
+    element.style.top = node.y + "px";
+    var glyph = node2("span", "dyx-flow-node-glyph", type.glyph);
+    glyph.style.background = type.color;
+    var text = node2("div", "dyx-flow-node-text");
+    text.append(node2("b", "", node.name), node2("span", "", flowNodeSub(node)));
+    var badge = node2("span", "dyx-flow-node-state");
+    var inPort = node2("button", "dyx-flow-port", "");
+    inPort.type = "button";
+    inPort.dataset.side = "in";
+    inPort.dataset.nid = node.id;
+    inPort.setAttribute("aria-label", node.name + " 入口");
+    var outPort = node2("button", "dyx-flow-port", "");
+    outPort.type = "button";
+    outPort.dataset.side = "out";
+    outPort.dataset.nid = node.id;
+    outPort.setAttribute("aria-label", node.name + " 出口");
+    element.append(glyph, text, badge, inPort, outPort);
+    return element;
+  }
+
+  // 别名：避免与外层 node() 工厂混淆。
+  function node2(tag, className, text) { return node(tag, className, text); }
+
+  function renderFlowShell(flow) {
+    var shell = node("div", "dyx-flow-shell");
+    var palette = node("div", "dyx-flow-palette");
+    var groups = [];
+    Object.keys(FLOW_NODE_TYPES).forEach(function (key) {
+      var type = FLOW_NODE_TYPES[key];
+      if (groups.indexOf(type.group) < 0) groups.push(type.group);
+    });
+    groups.forEach(function (group) {
+      palette.append(node("h4", "", group));
+      Object.keys(FLOW_NODE_TYPES).forEach(function (key) {
+        var type = FLOW_NODE_TYPES[key];
+        if (type.group !== group) return;
+        var item = node2("button", "dyx-flow-pi");
+        item.type = "button";
+        item.title = "点击加入画布";
+        var glyph = node2("span", "dyx-flow-glyph", type.glyph);
+        glyph.style.background = type.color;
+        item.append(glyph, node2("span", "", type.name));
+        item.addEventListener("click", function () { addFlowNode(key); });
+        palette.append(item);
+      });
+    });
+    var canvas = node2("div", "dyx-flow-canvas");
+    canvas.setAttribute("aria-label", "编排画布：拖拽节点调整位置，从右侧圆点拖到目标左侧圆点连线");
+    var stage = node2("div", "dyx-flow-stage");
+    var svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+    svg.setAttribute("class", "dyx-flow-edges");
+    stage.append(svg);
+    flow.nodes.forEach(function (node) { stage.append(flowNodeEl(node, node.id === state.flows.sel)); });
+    canvas.append(stage);
+    shell.append(palette, canvas);
+    return shell;
+  }
+
+  function flowStage() { return main.querySelector(".dyx-flow-stage"); }
+
+  function flowSvg() { return main.querySelector(".dyx-flow-edges"); }
+
+  function flowPorts(node, side) {
+    return side === "out" ? { x: node.x + 172, y: node.y + 25 } : { x: node.x, y: node.y + 25 };
+  }
+
+  function flowEdgePath(a, b) {
+    var dx = b.x - a.x;
+    var sign = dx < 0 ? -1 : 1;
+    var distance = Math.max(34, Math.min(110, Math.abs(dx) * 0.5));
+    var cx1, cy1, cx2, cy2;
+    if (Math.abs(dx) < 40) {
+      var dy = b.y - a.y;
+      var vertical = Math.max(28, Math.min(90, Math.abs(dy) * 0.5)) * (dy < 0 ? -1 : 1);
+      cx1 = a.x; cy1 = a.y + vertical; cx2 = b.x; cy2 = b.y - vertical;
+    } else {
+      cx1 = a.x + sign * distance; cy1 = a.y; cx2 = b.x - sign * distance; cy2 = b.y;
+    }
+    return "M" + a.x + "," + a.y + " C" + cx1 + "," + cy1 + " " + cx2 + "," + cy2 + " " + b.x + "," + b.y;
+  }
+
+  function drawFlowEdges(ghost) {
+    var svg = flowSvg();
+    var flow = activeFlow();
+    if (!svg || !flow) return;
+    var stage = flowStage();
+    svg.setAttribute("width", Math.max(640, stage ? stage.offsetWidth : 640));
+    svg.setAttribute("height", Math.max(600, stage ? stage.offsetHeight : 600));
+    var run = state.flows.run && state.flows.run.flowId === flow.id ? state.flows.run : null;
+    var parts = [];
+    flow.edges.forEach(function (edge, index) {
+      var from = flow.nodes.find(function (node) { return node.id === edge.f; });
+      var to = flow.nodes.find(function (node) { return node.id === edge.t; });
+      if (!from || !to) return;
+      var path = flowEdgePath(flowPorts(from, "out"), flowPorts(to, "in"));
+      var cls = "";
+      if (state.flows.selEdge === index) cls = "danger";
+      else if (run && run.nodes[edge.f] === "成功") cls = "ok";
+      parts.push({ path: path, cls: cls, label: edge.label || "", mid: flowPorts(from, "out"), end: flowPorts(to, "in"), index: index });
+    });
+    svg.textContent = "";
+    parts.forEach(function (item) {
+      var base = document.createElementNS("http://www.w3.org/2000/svg", "path");
+      base.setAttribute("d", item.path);
+      if (item.cls) base.setAttribute("class", item.cls);
+      svg.append(base);
+      var hit = document.createElementNS("http://www.w3.org/2000/svg", "path");
+      hit.setAttribute("d", item.path);
+      hit.setAttribute("class", "dyx-flow-edge-hit");
+      hit.style.cssText = "fill:none;stroke:transparent;stroke-width:12;pointer-events:stroke;cursor:pointer";
+      hit.addEventListener("click", function () {
+        if (state.flows.selEdge === item.index) {
+          flow.edges.splice(item.index, 1);
+          state.flows.selEdge = -1;
+          saveFlowSoon();
+          drawFlowEdges();
+          toast("连线已删除");
+        } else {
+          state.flows.selEdge = item.index;
+          drawFlowEdges();
+          toast("再次点击该连线即可删除");
+        }
+      });
+      svg.append(hit);
+      if (item.label) {
+        var label = document.createElementNS("http://www.w3.org/2000/svg", "text");
+        label.setAttribute("class", "dyx-flow-elabel");
+        label.setAttribute("x", Math.round((item.mid.x + item.end.x) / 2));
+        label.setAttribute("y", Math.round((item.mid.y + item.end.y) / 2) - 8);
+        label.setAttribute("text-anchor", "middle");
+        label.textContent = item.label;
+        svg.append(label);
+      }
+    });
+    if (ghost && ghost.from) {
+      var ghostFrom = flow.nodes.find(function (node) { return node.id === ghost.from; });
+      if (ghostFrom) {
+        var ghostPath = document.createElementNS("http://www.w3.org/2000/svg", "path");
+        ghostPath.setAttribute("d", flowEdgePath(flowPorts(ghostFrom, "out"), ghost.to));
+        ghostPath.setAttribute("stroke-dasharray", "5 4");
+        ghostPath.style.cssText = "fill:none;stroke:var(--dyx-brand);stroke-width:1.6";
+        svg.append(ghostPath);
+      }
+    }
+  }
+
+  function renderFlowStates() {
+    var flow = activeFlow();
+    if (!flow) return;
+    var run = state.flows.run && state.flows.run.flowId === flow.id ? state.flows.run : null;
+    var stage = flowStage();
+    if (!stage) return;
+    stage.querySelectorAll(".dyx-flow-node").forEach(function (element) {
+      var node = flow.nodes.find(function (item) { return item.id === element.dataset.nid; });
+      if (!node) return;
+      var status = run ? run.nodes[node.id] : "";
+      element.classList.remove("run", "ok", "fail", "wait", "skip");
+      var tone = { "执行中": "run", "成功": "ok", "失败": "fail", "等待确认": "wait", "已跳过": "skip" }[status] || "";
+      if (tone) element.classList.add(tone);
+      var badge = element.querySelector(".dyx-flow-node-state");
+      if (badge) badge.textContent = status === "执行中" ? "…" : status === "成功" ? "✓" : status === "失败" ? "✕" : status === "等待确认" ? "⏸" : status === "已跳过" ? "跳过" : "";
+      var oldActions = element.querySelector(".dyx-flow-node-actions");
+      if (oldActions) oldActions.remove();
+      if (status === "等待确认") {
+        var actions = node2("div", "dyx-flow-node-actions");
+        actions.append(
+          button("✓ 通过", "dyx-btn-sm primary", function (event) {
+            event.stopPropagation();
+            continueFlowCheckpoint(node.id, true);
+          }),
+          button("✕ 终止", "dyx-btn-sm danger", function (event) {
+            event.stopPropagation();
+            continueFlowCheckpoint(node.id, false);
+          })
+        );
+        element.append(actions);
+      }
+    });
+  }
+
+  function bindFlowCanvas() {
+    var canvas = main.querySelector(".dyx-flow-canvas");
+    var stage = flowStage();
+    if (!canvas || !stage) return;
+    var drag = null;
+    stage.addEventListener("pointerdown", function (event) {
+      var port = event.target.closest(".dyx-flow-port");
+      var flow = activeFlow();
+      if (!flow) return;
+      if (port && port.dataset.side === "out") {
+        state.flows.connectFrom = port.dataset.nid;
+        event.preventDefault();
+        return;
+      }
+      if (port && port.dataset.side === "in" && state.flows.connectFrom) {
+        finishFlowConnect(port.dataset.nid);
+        return;
+      }
+      var nodeElement = event.target.closest(".dyx-flow-node");
+      if (!nodeElement) return;
+      var node = flow.nodes.find(function (item) { return item.id === nodeElement.dataset.nid; });
+      if (!node) return;
+      drag = { node: node, element: nodeElement, startX: event.clientX, startY: event.clientY, originX: node.x, originY: node.y, moved: false };
+      event.preventDefault();
+    });
+    canvas.addEventListener("pointermove", function (event) {
+      var flow = activeFlow();
+      if (!flow) return;
+      if (state.flows.connectFrom) {
+        var rect = stage.getBoundingClientRect();
+        drawFlowEdges({ from: state.flows.connectFrom, to: { x: event.clientX - rect.left, y: event.clientY - rect.top } });
+        return;
+      }
+      if (!drag) return;
+      var dx = event.clientX - drag.startX;
+      var dy = event.clientY - drag.startY;
+      if (Math.abs(dx) > 3 || Math.abs(dy) > 3) drag.moved = true;
+      if (!drag.moved) return;
+      drag.node.x = Math.max(0, drag.originX + dx);
+      drag.node.y = Math.max(0, drag.originY + dy);
+      drag.element.style.left = drag.node.x + "px";
+      drag.element.style.top = drag.node.y + "px";
+      drawFlowEdges();
+    });
+    canvas.addEventListener("pointerup", function (event) {
+      var flow = activeFlow();
+      if (flow && state.flows.connectFrom) {
+        var target = event.target.closest("[data-nid]");
+        if (target && target.dataset.nid !== state.flows.connectFrom) finishFlowConnect(target.dataset.nid);
+        else if (!event.target.closest(".dyx-flow-port")) {
+          state.flows.connectFrom = "";
+          drawFlowEdges();
+        }
+      }
+      if (drag) {
+        if (!drag.moved) {
+          state.flows.sel = drag.node.id;
+          state.flows.selEdge = -1;
+          stage.querySelectorAll(".dyx-flow-node").forEach(function (element) {
+            element.classList.toggle("selected", element.dataset.nid === drag.node.id);
+          });
+          openFlowNodeConfig(drag.node);
+        } else {
+          saveFlowSoon();
+        }
+        drag = null;
+      }
+    });
+  }
+
+  function finishFlowConnect(toId) {
+    var flow = activeFlow();
+    if (!flow) return;
+    var exists = flow.edges.some(function (edge) { return edge.f === state.flows.connectFrom && edge.t === toId; });
+    if (!exists) {
+      flow.edges.push({ f: state.flows.connectFrom, t: toId, label: "" });
+      saveFlowSoon();
+      toast("已连线");
+    }
+    state.flows.connectFrom = "";
+    drawFlowEdges();
+  }
+
+  function addFlowNode(typeKey) {
+    var flow = activeFlow();
+    if (!flow) return;
+    var type = FLOW_NODE_TYPES[typeKey];
+    if (!type) return;
+    if (flow.nodes.length >= 64) return toast("节点数量已达上限", true);
+    var suffix = flow.nodes.filter(function (item) { return item.tp === typeKey; }).length;
+    var node = clampFlowNode({
+      id: "n" + Date.now().toString(36) + Math.random().toString(36).slice(2, 5),
+      tp: typeKey,
+      name: type.name + (suffix ? " " + (suffix + 1) : ""),
+      x: 60 + (flow.nodes.length % 3) * 196,
+      y: 470 + Math.floor(flow.nodes.length / 3) * 130,
+      cfg: {}
+    });
+    (type.fields || []).forEach(function (field2) {
+      if (field2.o && field2.o.length) node.cfg[field2.k] = field2.o[0];
+    });
+    flow.nodes.push(node);
+    state.flows.sel = node.id;
+    saveFlowSoon();
+    render();
+    toast("已加入「" + type.name + "」，可拖拽调整位置");
+  }
+
+  function openFlowNodeConfig(flowNode) {
+    var flow = activeFlow();
+    if (!flow) return;
+    var type = FLOW_NODE_TYPES[flowNode.tp];
+    var dialog = modal("节点：" + type.name);
+    var form = node2("div", "dyx-form");
+    var nameInput = input("text", "节点名称", flowNode.name);
+    form.append(field("节点名称", nameInput));
+    (type.fields || []).forEach(function (field2) {
+      if (field2.o && field2.o.length) {
+        var select = node2("select", "dyx-select");
+        field2.o.forEach(function (option) { var entry = node2("option", "", option); entry.value = option; select.append(entry); });
+        if (field2.k === "pipe") {
+          if (!state.pipelines.items.length) {
+            rpc("pipelines.list", rpcArgs({ page: 1, pageSize: 30 })).then(function (result) {
+              state.pipelines.items = result.items || [];
+              fillPipeOptions(select);
+            }).catch(function () {});
+          }
+          fillPipeOptions(select);
+        } else if (field2.k === "plan") {
+          if (!state.tests.plans.length) {
+            rpc("tests.plans.list", rpcArgs({ page: 1, pageSize: 30 })).then(function (result) {
+              state.tests.plans = result.items || [];
+              fillPlanOptions(select);
+            }).catch(function () {});
+          }
+          fillPlanOptions(select);
+        } else if (field2.k === "st") {
+          if (!state.defectStatusOptions.length) {
+            rpc("defect.statusOptions", rpcArgs({})).then(function (result) {
+              state.defectStatusOptions = result.items || [];
+              fillStatusOptions(select);
+            }).catch(function () {});
+          }
+          fillStatusOptions(select);
+        }
+        select.value = flowNode.cfg[field2.k] || "";
+        select.addEventListener("change", function () {
+          flowNode.cfg[field2.k] = select.value;
+          saveFlowSoon();
+          refreshNodeText(flowNode);
+        });
+        form.append(field(field2.l, select));
+      } else {
+        var control = input("text", field2.l, flowNode.cfg[field2.k] || "");
+        control.addEventListener("change", function () {
+          flowNode.cfg[field2.k] = control.value;
+          saveFlowSoon();
+          refreshNodeText(flowNode);
+        });
+        form.append(field(field2.l + "（可手动输入）", control));
+      }
+    });
+    var runStatus = state.flows.run && state.flows.run.flowId === flow.id ? state.flows.run.nodes[flowNode.id] : "";
+    if (runStatus === "等待确认") {
+      form.append(node2("div", "dyx-note", "该检查点正在等待人工确认。"));
+    }
+    dialog.body.append(form);
+    function fillPipeOptions(select) {
+      var wanted = flowNode.cfg.pipe || "";
+      select.textContent = "";
+      var placeholder = node2("option", "", wanted || "选择流水线");
+      placeholder.value = wanted;
+      select.append(placeholder);
+      state.pipelines.items.forEach(function (item) {
+        var option = node2("option", "", item.name);
+        option.value = item.name;
+        select.append(option);
+      });
+      select.value = wanted;
+    }
+    function fillPlanOptions(select) {
+      var wanted = flowNode.cfg.plan || "";
+      select.textContent = "";
+      var placeholder = node2("option", "", wanted || "选择测试计划");
+      placeholder.value = wanted;
+      select.append(placeholder);
+      state.tests.plans.forEach(function (item) {
+        var option = node2("option", "", item.name);
+        option.value = item.name;
+        select.append(option);
+      });
+      select.value = wanted;
+    }
+    function fillStatusOptions(select) {
+      var wanted = flowNode.cfg.st || "";
+      select.textContent = "";
+      var placeholder = node2("option", "", wanted || "选择状态");
+      placeholder.value = wanted;
+      select.append(placeholder);
+      var byName = new Map();
+      state.defectStatusOptions.forEach(function (item) { if (!byName.has(item.name)) byName.set(item.name, item.name); });
+      byName.forEach(function (name) {
+        var option = node2("option", "", name);
+        option.value = name;
+        select.append(option);
+      });
+      select.value = wanted;
+    }
+    function refreshNodeText(target) {
+      var element = main.querySelector('.dyx-flow-node[data-nid="' + target.id + '"]');
+      if (!element) return;
+      var sub = element.querySelector(".dyx-flow-node-text span");
+      if (sub) sub.textContent = flowNodeSub(target);
+      var title = element.querySelector(".dyx-flow-node-text b");
+      if (title) title.textContent = target.name;
+    }
+    nameInput.addEventListener("change", function () {
+      flowNode.name = nameInput.value.trim() || type.name;
+      saveFlowSoon();
+      refreshNodeText(flowNode);
+    });
+    if (runStatus === "等待确认") {
+      dialog.foot.append(
+        button("✕ 终止", "danger", function () { dialog.close(); continueFlowCheckpoint(flowNode.id, false); }),
+        button("✓ 通过并继续", "primary", function () { dialog.close(); continueFlowCheckpoint(flowNode.id, true); })
+      );
+    } else {
+      dialog.foot.append(
+        button("删除节点", "danger", function () {
+          flow.nodes = flow.nodes.filter(function (item) { return item.id !== flowNode.id; });
+          flow.edges = flow.edges.filter(function (edge) { return edge.f !== flowNode.id && edge.t !== flowNode.id; });
+          state.flows.sel = "";
+          saveFlowSoon();
+          dialog.close();
+          render();
+        }),
+        button("完成", "primary", dialog.close)
+      );
+    }
+  }
+
+  function openFlowRuns(flow) {
+    var dialog = modal("运行记录：" + flow.name);
+    if (!flow.runs.length) dialog.body.append(empty("还没有运行记录", "点击画布右上角“运行”开始第一次执行。"));
+    else {
+      var list = node("div", "dyx-record-list");
+      flow.runs.forEach(function (run) {
+        var row = node("article", "dyx-record");
+        var head = node("div", "dyx-record-head");
+        head.append(
+          node("span", "dyx-badge " + (run.status === "成功" ? "ok" : run.status === "失败" ? "fail" : "run"), run.status),
+          node("span", "dyx-muted", shortDateTime(run.startedAt) + " · " + (run.durationMs ? Math.round(run.durationMs / 1000) + " 秒" : ""))
+        );
+        var meta = node("div", "dyx-record-meta");
+        meta.append(node("span", "", "触发：" + (run.trg || "手动")));
+        (run.log || []).slice(-3).forEach(function (entry) {
+          if (entry.m) meta.append(node("span", "", entry.m));
+        });
+        row.append(head, meta);
+        list.append(row);
+      });
+      dialog.body.append(list);
+    }
+    dialog.foot.append(button("关闭", "", dialog.close));
+  }
+
+  function incomingFlowEdges(flow, nodeId) {
+    return flow.edges.filter(function (edge) { return edge.t === nodeId; });
+  }
+
+  function flowDownstream(flow, nodeId) {
+    var result = [];
+    var stack = [nodeId];
+    while (stack.length) {
+      var current = stack.pop();
+      flow.edges.forEach(function (edge) {
+        if (edge.f === current && result.indexOf(edge.t) < 0) {
+          result.push(edge.t);
+          stack.push(edge.t);
+        }
+      });
+    }
+    return result;
+  }
+
+  function startFlowRun(flow, defectContext) {
+    if (state.flows.run && state.flows.run.active) return toast("已有编排正在运行，请等待完成", true);
+    if (!flow.nodes.length) return toast("画布是空的，先添加节点", true);
+    var now = Date.now();
+    var nodes = {};
+    flow.nodes.forEach(function (node) { nodes[node.id] = "待执行"; });
+    state.flows.run = {
+      flowId: flow.id,
+      id: "r" + now.toString(36) + Math.random().toString(36).slice(2, 5),
+      active: true,
+      status: "进行中",
+      trg: defectContext && defectContext.serialNumber ? "缺陷 " + defectContext.serialNumber : "手动",
+      startedAt: new Date(now).toISOString(),
+      durationMs: 0,
+      nodes: nodes,
+      log: [],
+      startMs: now
+    };
+    state.flows.runCtx = defectContext ? { defectId: defectContext.defectId, detail: null } : { defectId: "", detail: null };
+    flowLog("▶ 触发编排：" + flow.name + "（" + state.flows.run.trg + "）", "warn");
+    persistFlowRun(flow, true);
+    renderFlowStates();
+    drawFlowEdges();
+    stepFlowRun();
+  }
+
+  function flowLog(message, kind) {
+    var run = state.flows.run;
+    if (!run) return;
+    var elapsed = Math.max(0, Math.round((Date.now() - run.startMs) / 1000));
+    run.log.push({ t: elapsed + "s", m: String(message).slice(0, 500), c: kind || "" });
+    if (run.log.length > 400) run.log.splice(0, run.log.length - 400);
+  }
+
+  var persistRunTimer = null;
+  function persistFlowRun(flow, immediate) {
+    if (!state.flows.run || state.flows.run.flowId !== flow.id) return;
+    if (persistRunTimer) clearTimeout(persistRunTimer);
+    var submit = function () {
+      var run = state.flows.run;
+      if (!run || run.flowId !== flow.id) return;
+      run.durationMs = run.startMs ? Date.now() - run.startMs : 0;
+      rpc("flows.run.save", { flowId: flow.id, run: {
+        id: run.id,
+        status: run.status,
+        trg: run.trg,
+        startedAt: run.startedAt,
+        endedAt: run.status === "成功" || run.status === "失败" ? new Date().toISOString() : "",
+        durationMs: run.durationMs,
+        nodes: run.nodes,
+        log: run.log
+      } }).catch(function () {});
+    };
+    if (immediate) submit();
+    else persistRunTimer = setTimeout(submit, 700);
+  }
+
+  function stepFlowRun() {
+    var run = state.flows.run;
+    var flow = activeFlow();
+    if (!run || !run.active || !flow || run.flowId !== flow.id) return;
+    var ready = flow.nodes.filter(function (node) {
+      return run.nodes[node.id] === "待执行" && incomingFlowEdges(flow, node.id).every(function (edge) { return run.nodes[edge.f] === "成功"; });
+    });
+    if (!ready.length) {
+      var running = flow.nodes.some(function (node) { return run.nodes[node.id] === "执行中"; });
+      if (!running) finishFlowRun();
+      return;
+    }
+    ready.forEach(function (node) {
+      run.nodes[node.id] = "执行中";
+      flowLog("· " + node.name + "：执行中…");
+      executeFlowNode(node);
+    });
+    renderFlowStates();
+    drawFlowEdges();
+    persistFlowRun(flow, false);
+  }
+
+  function flowConditionPasses(node, done) {
+    var cfg = node.cfg || {};
+    if (cfg.f === "根因定位") { done(true); return; }
+    var wanted = cfg.op === "=" ? cfg.v : null;
+    var ceiling = cfg.op === "≤" ? cfg.v : null;
+    var ranks = { P0: 0, P1: 1, P2: 2, P3: 3 };
+    ensureFlowDefect(function (detail) {
+      var priority = String((detail && detail.defect && (detail.defect.priority || detail.defect.severity)) || "").toUpperCase();
+      var rank = ranks[(priority.match(/P[0-3]/) || [""])[0]];
+      if (ceiling !== null) {
+        done(rank !== undefined ? rank <= (ranks[ceiling] === undefined ? 1 : ranks[ceiling]) : true);
+        return;
+      }
+      if (wanted !== null) { done(priority === wanted); return; }
+      done(true);
+    });
+  }
+
+  // 懒加载当前触发缺陷详情；无缺陷上下文时回调 null。
+  function ensureFlowDefect(done) {
+    var ctx = state.flows.runCtx || (state.flows.runCtx = { defectId: "", detail: null });
+    if (!ctx.defectId) { done(null); return; }
+    if (ctx.detail) { done(ctx.detail); return; }
+    rpc("defect.get", rpcArgs({ defectId: ctx.defectId })).then(function (detail) {
+      ctx.detail = detail;
+      done(detail);
+    }).catch(function (error) {
+      flowLog("✕ 缺陷详情读取失败：" + error.message, "error");
+      done(null);
+    });
+  }
+
+  function executeFlowNode(node) {
+    var run = state.flows.run;
+    var flow = activeFlow();
+    var finish = function (status, message, kind) {
+      run.nodes[node.id] = status;
+      if (message) flowLog((status === "成功" ? "✓ " : status === "失败" ? "✕ " : "— ") + node.name + "：" + message, kind || (status === "失败" ? "error" : ""));
+      renderFlowStates();
+      drawFlowEdges();
+      if (status === "成功" || status === "失败" || status === "已跳过") {
+        if (status === "成功" && node.tp === "op-cond") applyFlowConditionBranches(node);
+        if (status === "失败") skipFlowDownstream(flow, node.id);
+        stepFlowRun();
+      } else {
+        persistFlowRun(flow, false);
+      }
+    };
+    var type = FLOW_NODE_TYPES[node.tp];
+    var action;
+    try {
+      action = runFlowNodeAction(node, type);
+    } catch (error) {
+      action = Promise.reject(error);
+    }
+    action.then(function (result) {
+      if (result && result.checkpoint) {
+        run.status = "等待确认";
+        finish("等待确认", result.message || "等待人工确认", "warn");
+        return;
+      }
+      run.status = "进行中";
+      finish("成功", result && result.message || "完成");
+    }).catch(function (error) {
+      finish("失败", error instanceof Error ? error.message : String(error));
+    });
+  }
+
+  function applyFlowConditionBranches(node) {
+    var flow = activeFlow();
+    var run = state.flows.run;
+    var cfg = node.cfg || {};
+    flow.edges.filter(function (edge) { return edge.f === node.id; }).forEach(function (edge) {
+      var pass = edge.label === "否" ? flowConditionResult === false : flowConditionResult !== false;
+      if (!pass) {
+        var target = flow.nodes.find(function (item) { return item.id === edge.t; });
+        if (target && run.nodes[target.id] === "待执行") {
+          run.nodes[target.id] = "已跳过";
+          flowLog("— 条件" + (edge.label === "否" ? "成立，跳过" : "不成立，跳过") + "：" + target.name);
+          flowDownstream(flow, target.id).forEach(function (downId) {
+            var down = flow.nodes.find(function (item) { return item.id === downId; });
+            if (down && run.nodes[down.id] === "待执行") run.nodes[down.id] = "已跳过";
+          });
+        }
+      }
+    });
+    renderFlowStates();
+  }
+
+  var flowConditionResult = true;
+
+  function runFlowNodeAction(node, type) {
+    var cfg = node.cfg || {};
+    if (node.tp === "op-cond") {
+      return new Promise(function (resolve) {
+        flowConditionPasses(node, function (passes) {
+          flowConditionResult = passes;
+          resolve({ message: "条件" + (passes ? "成立" : "不成立") });
+        });
+      });
+    }
+    if (node.tp === "op-delay") {
+      var minutes = String(cfg.d || "1 分钟");
+      return new Promise(function (resolve) {
+        flowLog("⏳ 延时等待（演示环境按 2 秒执行）");
+        setTimeout(function () { resolve({ message: "已等待 " + minutes }); }, 2000);
+      });
+    }
+    if (node.tp === "ntf-msg") {
+      return ensureFlowDefect(function (detail) {
+        var serial = detail && detail.defect ? detail.defect.serialNumber : "";
+        var body = String(cfg.tpl || "验收提醒") + (serial ? "：" + serial + " " + (detail.defect.subject || "") : "：请关注工作台更新");
+        return rpc("system.notification.show", { title: "云效编排提醒", body: body, tag: "dyx-flow-" + Date.now() }).then(function (result) {
+          return { message: result && result.accepted ? "系统通知已提交" : "当前环境不支持系统通知" };
+        });
+      });
+    }
+    if (node.tp === "ntf-comment") {
+      return new Promise(function (resolve, reject) {
+        ensureFlowDefect(function (detail) {
+          var defect = detail && detail.defect;
+          if (!defect) { reject(new Error("该节点需要缺陷上下文（请从待处理缺陷触发或先接一个触发器）")); return; }
+          var content = "【编排】" + String(cfg.tpl || "处理摘要") + "：自动流程已执行到该节点。";
+          rpc("defect.comment.create", rpcArgs({ defectId: defect.id, content: content })).then(function () {
+            resolve({ message: "评论已回写到 " + defect.serialNumber });
+          }).catch(reject);
+        });
+      });
+    }
+    if (node.tp === "act-item") {
+      return new Promise(function (resolve, reject) {
+        ensureFlowDefect(function (detail) {
+          var defect = detail && detail.defect;
+          if (!defect) { reject(new Error("该节点需要缺陷上下文")); return; }
+          var wanted = String(cfg.st || "已修复");
+          rpc("defect.statuses", rpcArgs({ defectId: defect.id })).then(function (statuses) {
+            var status = (statuses || []).find(function (item) { return item.name === wanted; });
+            if (!status) throw new Error("该缺陷的工作流中没有\"" + wanted + "\"状态，请在节点配置里调整目标状态");
+            var task = rpc("defect.status.update", rpcArgs({ defectId: defect.id, statusId: status.id }));
+            var comment = cfg.cmt === "开"
+              ? rpc("defect.comment.create", rpcArgs({ defectId: defect.id, content: "【编排】状态已更新为" + wanted + "。" }))
+              : Promise.resolve();
+            return Promise.all([task, comment]);
+          }).then(function (values) {
+            var updated = values[0];
+            var listed = state.defects.items.find(function (entry) { return entry.id === updated.id; });
+            if (listed) Object.assign(listed, updated);
+            resolve({ message: defect.serialNumber + " 状态 → " + wanted });
+          }).catch(reject);
+        });
+      });
+    }
+    if (node.tp === "act-pipe") {
+      var ensurePipelines = state.pipelines.items.length
+        ? Promise.resolve()
+        : rpc("pipelines.list", rpcArgs({ page: 1, pageSize: 30 })).then(function (result) { state.pipelines.items = result.items || []; });
+      return ensurePipelines.then(function () {
+        var wanted = String(cfg.pipe || "");
+        var pipeline = (state.pipelines.items || []).find(function (item) { return item.name === wanted; })
+          || (state.pipelines.items || [])[0];
+        if (!pipeline) throw new Error("未找到可运行的流水线");
+        return rpc("pipeline.run.create", rpcArgs({ pipelineId: pipeline.id, comment: "云效编排自动运行" })).then(function (result) {
+          return { message: "流水线「" + pipeline.name + "」已触发（#" + result.pipelineRunId + "）" };
+        });
+      });
+    }
+    if (node.tp === "act-agent") {
+      return new Promise(function (resolve, reject) {
+        runFlowAgent(node, resolve, reject);
+      });
+    }
+    if (type && type.checkpoint) {
+      return Promise.resolve({ checkpoint: true, message: "人工检查点：" + flowNodeSub(node) + "；确认后在节点上点“✓ 通过”继续" });
+    }
+    return Promise.resolve({ message: "完成" });
+  }
+
+  // DSH 智能处理：与缺陷“草稿/处理”同一通道。带缺陷上下文时携带标题/描述/图片，
+  // 否则发送节点说明文本。生成草稿=填输入框不发送；直接发送=新会话直接 prompt。
+  function runFlowAgent(node, resolve, reject) {
+    var cfg = node.cfg || {};
+    var binding = selectedAccount() && selectedAccount().workspace || null;
+    if (!binding || !binding.id) { reject(new Error("当前项目未绑定 DSH 工作区，请先到设置页绑定")); return; }
+    var conversation = handleConversation();
+    if (!conversation) { reject(new Error("会话服务尚未就绪，请重启页面后重试")); return; }
+    ensureFlowDefect(function (detail) {
+      var prepare = detail
+        ? buildHandlePayload(detail).then(function (payload) {
+            return { text: payload.text, images: payload.images };
+          })
+        : Promise.resolve({ text: "【编排】" + node.name + "：" + flowNodeSub(node), images: [] });
+      prepare.then(function (payload) {
+        return ensureWorkspaceVisible(binding.id).then(function () {
+          if (cfg.mode === "生成草稿") return sendHandleDraft(conversation, binding.id, payload);
+          return sendHandleImmediate(conversation, binding.id, payload);
+        }).then(function () {
+          return { message: "已" + (cfg.mode === "生成草稿" ? "填入工作区草稿" : "发送到工作区新会话") + "（" + (binding.title || binding.id) + "）" };
+        });
+      }).then(resolve, reject);
+    });
+  }
+
+  function skipFlowDownstream(flow, nodeId) {
+    var run = state.flows.run;
+    flowDownstream(flow, nodeId).forEach(function (id) {
+      var node = flow.nodes.find(function (item) { return item.id === id; });
+      if (node && run.nodes[id] === "待执行") {
+        run.nodes[id] = "已跳过";
+        flowLog("— 跳过：" + node.name);
+      }
+    });
+  }
+
+  function continueFlowCheckpoint(nodeId, pass) {
+    var run = state.flows.run;
+    var flow = activeFlow();
+    if (!run || !flow || run.flowId !== flow.id || run.nodes[nodeId] !== "等待确认") return;
+    var node = flow.nodes.find(function (item) { return item.id === nodeId; });
+    run.active = true;
+    run.status = "进行中";
+    if (pass) {
+      run.nodes[nodeId] = "成功";
+      flowLog("✓ " + (node ? node.name : "检查点") + "：人工确认通过", "ok");
+      renderFlowStates();
+      drawFlowEdges();
+      stepFlowRun();
+    } else {
+      run.nodes[nodeId] = "失败";
+      flowLog("✕ " + (node ? node.name : "检查点") + "：人工终止", "error");
+      skipFlowDownstream(flow, nodeId);
+      finishFlowRun();
+    }
+  }
+
+  function finishFlowRun() {
+    var run = state.flows.run;
+    var flow = activeFlow();
+    if (!run) return;
+    run.active = false;
+    var failed = Object.keys(run.nodes).some(function (id) { return run.nodes[id] === "失败"; });
+    run.status = failed ? "失败" : "成功";
+    run.durationMs = run.startMs ? Date.now() - run.startMs : 0;
+    flow.nodes.forEach(function (node) { if (run.nodes[node.id] === "待执行") run.nodes[node.id] = "已跳过"; });
+    flowLog(failed ? "■ 编排结束：失败" : "■ 编排结束：成功", failed ? "error" : "ok");
+    if (flow) {
+      flow.runs = flow.runs || [];
+      flow.runs.unshift({
+        id: run.id,
+        status: run.status,
+        trg: run.trg,
+        startedAt: run.startedAt,
+        endedAt: new Date().toISOString(),
+        durationMs: run.durationMs,
+        nodes: Object.assign({}, run.nodes),
+        log: run.log.slice(-200)
+      });
+      flow.runs = flow.runs.slice(0, 30);
+      persistFlowRun(flow, true);
+    }
+    renderFlowStates();
+    drawFlowEdges();
+    toast(failed ? "编排运行失败：可从失败节点重试或在设置里调整后重跑" : "编排运行成功", failed);
+  }
+
+  // 通知联动：新增待处理缺陷时，自动运行启用了“缺陷自动触发”的编排。
+  function maybeAutoRunFlows(items) {
+    if (!state.flows.loaded) {
+      loadFlows().then(function () { maybeAutoRunFlows(items); }).catch(function () {});
+      return;
+    }
+    var first = (items || []).find(function (item) { return item && item.id; });
+    if (!first) return;
+    state.flows.items.forEach(function (flow) {
+      if (!flow.on || !flow.autoRun) return;
+      if (state.flows.run && state.flows.run.active) return;
+      var hasDefectTrigger = flow.nodes.some(function (node) {
+        return node.tp === "trg-item" && (node.cfg.tp === "缺陷" || !node.cfg.tp);
+      });
+      if (!hasDefectTrigger) return;
+      toast("检测到新增缺陷，自动运行编排「" + flow.name + "」");
+      startFlowRun(flow, { defectId: first.id, serialNumber: first.serialNumber || "" });
+    });
+  }
+
   function mount(container) {
     root = node("div", "dyx-root"); root.id = ROOT_ID;
     shell = node("div", "dyx-shell");
@@ -1843,19 +3768,55 @@ function createWorkspace(onRequestClose, notifier, services) {
     var closeButton = button("×", "dyx-close", close); closeButton.setAttribute("aria-label", "关闭云效工作台");
     head.append(logo, copy);
     var body = node("div", "dyx-body"); var nav = node("nav", "dyx-nav");
-    // 页签按使用频率排序：缺陷、流水线为工作区，账号/项目等配置收敛到设置页。
-    [["defects", "缺陷"], ["pipelines", "流水线"], ["overview", "设置"]].forEach(function (item) {
+    // 页签按使用频率排序：概览聚合待办，缺陷/流水线为核心工作区，代码/测试/制品
+    // 接入云效其他域，编排承载自动化流程，账号/项目等配置收敛到设置页。
+    [["dashboard", "概览"], ["defects", "工作项"], ["pipelines", "流水线"], ["code", "代码"], ["tests", "测试"], ["packages", "制品"], ["flows", "编排"], ["overview", "设置"]].forEach(function (item) {
       var tab = node("button", item[0] === state.tab ? "active" : ""); tab.type = "button"; tab.append(node("span", "", item[1])); tab.addEventListener("click", function () { setTab(item[0]); }); navButtons[item[0]] = tab; nav.append(tab);
     });
+    // 全页模式：面板吃满除聊天列以外的宽度；侧栏模式恢复上次拖拽宽度。
+    var expandButton = button("⤢", "dyx-expand", function () {
+      setFullMode(!FULL_MODE_ACTIVE);
+    });
+    expandButton.setAttribute("aria-label", "切换全页模式");
+    expandButton.title = "全页 / 侧栏切换";
+    function setFullMode(active) {
+      FULL_MODE_ACTIVE = Boolean(active);
+      try { window.localStorage.setItem(FULL_MODE_STORAGE_KEY, FULL_MODE_ACTIVE ? "1" : ""); } catch (error) {}
+      if (root) root.dataset.full = FULL_MODE_ACTIVE ? "true" : "false";
+      expandButton.textContent = FULL_MODE_ACTIVE ? "⤡" : "⤢";
+      expandButton.setAttribute("aria-label", FULL_MODE_ACTIVE ? "收起为侧栏" : "全页展开");
+      // apply 层监听 resize 并按 clampPanelWidth 重算面板宽度。
+      window.dispatchEvent(new Event("resize"));
+    }
+    // 默认全页铺满；只有用户显式切回侧栏（localStorage 记 "0"）才以侧栏打开。
+    try { setFullMode(window.localStorage.getItem(FULL_MODE_STORAGE_KEY) !== "0"); } catch (error) { setFullMode(true); }
     // 布局：页签收进顶栏，与标题同一行，主体区整栏留给内容。
-    main = node("main", "dyx-main"); head.append(nav, closeButton); body.append(main); shell.append(head, body); root.append(shell); (container || document.body).append(root);
-    if (notifier) unsubscribeNotifier = notifier.subscribe(function () { if (root && state.tab === "defects") render(); });
+    main = node("main", "dyx-main"); head.append(nav, expandButton, closeButton); body.append(main); shell.append(head, body); root.append(shell); (container || document.body).append(root);
+    if (notifier) unsubscribeNotifier = notifier.subscribe(function () {
+      if (root && state.tab === "defects") render();
+      // 新增待处理缺陷时，自动运行启用了“缺陷自动触发”的编排。
+      var snapshot = notifier ? notifier.snapshot() : null;
+      if (root && snapshot && snapshot.lastAddedCount > 0 && Array.isArray(snapshot.lastAddedItems) && snapshot.lastAddedItems.length) {
+        maybeAutoRunFlows(snapshot.lastAddedItems);
+      }
+    });
     render();
     loadState().then(function () {
       render();
       if (state.tab === "defects" && selectedProject()) { loadDefects(); loadDefectFilterOptions(); }
       else if (state.tab === "pipelines" && selectedProject()) loadPipelines();
+      else if (state.tab === "dashboard") loadDashboard();
+      if (state.tab === "flows") loadFlows();
     }).catch(function (error) { toast(error.message, true); });
+    // 视口尺寸变化：缺陷页每页条数按新宽高重算（防抖 350ms），变化时重新加载列表。
+    onViewportResize = function () {
+      if (state.tab !== "defects" || !selectedProject()) return;
+      window.clearTimeout(defectResizeTimer);
+      defectResizeTimer = window.setTimeout(function () {
+        if (state.tab === "defects" && selectedProject() && computeDefectPageSize() !== state.defects.pageSize) loadDefects();
+      }, 350);
+    };
+    window.addEventListener("resize", onViewportResize);
   }
 
   function close() {
@@ -1868,6 +3829,11 @@ function createWorkspace(onRequestClose, notifier, services) {
     var value = document.getElementById(ROOT_ID); if (value) value.remove();
     if (unsubscribeNotifier) unsubscribeNotifier();
     unsubscribeNotifier = null;
+    if (onViewportResize) window.removeEventListener("resize", onViewportResize);
+    onViewportResize = null;
+    if (defectResizeTimer) { clearTimeout(defectResizeTimer); defectResizeTimer = null; }
+    if (saveFlowSoon.timer) { clearTimeout(saveFlowSoon.timer); saveFlowSoon.timer = null; }
+    if (persistRunTimer) { clearTimeout(persistRunTimer); persistRunTimer = null; }
     root = null;
   }
 
@@ -2193,6 +4159,15 @@ function renderRich(container, content, format, attachments, defectId, callRpc) 
     if (element.tagName === "A") { var href = safeUrl(element.getAttribute("href")); if (!href) element.removeAttribute("href"); else { element.href = href; element.target = "_blank"; element.rel = "noopener noreferrer"; } }
   });
   container.append(template.content);
+  // 图片统一收进横向缩略图条：避免描述里的大图逐张占满整页；
+  // 缩略图横向并排、过多自动换到下一排，点击全屏预览与右键菜单（wireDefectImage）保留。
+  // 注意：fragment append 后子节点已移入 container，须从 container 里查找。
+  var richImages = Array.from(container.querySelectorAll("img"));
+  if (richImages.length) {
+    var strip = node("div", "dyx-imgstrip");
+    richImages.forEach(function (img) { strip.append(img); });
+    container.append(strip);
+  }
 }
 
 // —— 缺陷“处理”到 DSH 工作区会话 ————————————————————————————————————————
@@ -2303,7 +4278,12 @@ function apply(ctx) {
     panelWidth = clampPanelWidth(value);
     if (workspaceFrame) workspaceFrame.style.setProperty("--dyx-workspace-width", panelWidth + "px");
     // 兜底：即使没找到宿主网格 frame，也把变量写在面板自身上，保证拖拽始终生效。
-    if (activePanelElement) activePanelElement.style.setProperty("--dyx-workspace-width", panelWidth + "px");
+    if (activePanelElement) {
+      activePanelElement.style.setProperty("--dyx-workspace-width", panelWidth + "px");
+      // 全页模式下面板改为 fixed 悬浮（覆盖中间聊天区），左侧从宿主导航轨右缘开始。
+      activePanelElement.classList.toggle("dyx-panel-full", FULL_MODE_ACTIVE);
+      activePanelElement.style.setProperty("--dyx-full-left", HOST_SIDEBAR_TRACK + "px");
+    }
     if (persist) {
       preferredPanelWidth = panelWidth;
       savePanelWidth(panelWidth);
@@ -2314,12 +4294,21 @@ function apply(ctx) {
     requestAnimationFrame(function () {
       var overlay = document.querySelector("[data-shell-overlay]");
       var frame = overlay && overlay.parentElement;
+      if (!frame) {
+        // 兜底：overlay 缺失时，从面板自身的祖先里找带内联网格的宿主框架。
+        var panel = document.querySelector(".dyx-right-panel");
+        frame = panel ? panel.closest("[style*='grid-template-columns']") : null;
+      }
       if (!frame) return;
       var match = String(frame.style.gridTemplateColumns || "").match(/^([\d.]+px)/);
-      frame.style.setProperty("--dyx-sidebar-track", match ? match[1] : "280px");
+      // 记录宿主左侧导航轨宽度：全页模式下面板 fixed 左偏移 = 导航轨宽度，
+      // 这样中间聊天列会被整面盖住，工作台占满整页。
+      if (match) HOST_SIDEBAR_TRACK = Math.max(0, Math.round(parseFloat(match[1])));
+      frame.style.setProperty("--dyx-sidebar-track", match ? match[1] : HOST_SIDEBAR_TRACK + "px");
       frame.style.setProperty("--dyx-workspace-width", panelWidth + "px");
       frame.setAttribute("data-dyx-workspace-open", "true");
       workspaceFrame = frame;
+      if (FULL_MODE_ACTIVE && activePanelElement) applyPanelWidth(panelWidth, false);
     });
   }
   function restoreWorkspaceFrame() {
@@ -2377,6 +4366,8 @@ function apply(ctx) {
       activeWorkspace = workspace;
       workspace.mount(hostRef.current);
       activePanelElement = panelRef.current;
+      // 面板挂载后立即按当前模式（含全页）应用一次宽度，避免全页类丢失。
+      applyPanelWidth(panelWidth, false);
       raiseWorkspacePanel(activePanelElement);
       if (pendingNoticeItems.length) {
         var nextItems = pendingNoticeItems;
