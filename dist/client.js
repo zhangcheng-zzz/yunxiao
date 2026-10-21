@@ -2904,6 +2904,15 @@ function createWorkspace(onRequestClose, notifier, services) {
     return (account ? account.name : "指定账号") + " · " + (scope.projectId ? (project && project.id === scope.projectId ? project.name : scope.projectId) : "当前项目");
   }
 
+  // 触发负责人：成员/负责人候选到位时显示名字，否则只标注已指定。
+  function policyAssigneeLabel(policy) {
+    if (!policy.trigger.assigneeId) return "";
+    var member = (state.defectMembers || []).concat(state.defectAssigneeOptions || []).find(function (item) {
+      return item.id === policy.trigger.assigneeId;
+    });
+    return member && member.name ? " · 负责人 " + member.name : " · 指定负责人";
+  }
+
   function policyMatchSummary(policy) {
     var match = policy.match || {};
     var parts = [];
@@ -2988,7 +2997,7 @@ function createWorkspace(onRequestClose, notifier, services) {
     title.title = policy.name;
     title.addEventListener("click", function () { openPolicyDrawer(policy, null); });
     var meta = node("div", "dyx-record-meta");
-    meta.append(node("span", "", policyScopeLabel(policy) + " · 每 " + policy.trigger.pollMinutes + " 分钟"));
+    meta.append(node("span", "", policyScopeLabel(policy) + " · 每 " + policy.trigger.pollMinutes + " 分钟" + policyAssigneeLabel(policy)));
     var matchText = policyMatchSummary(policy);
     if (matchText) meta.append(node("span", "", matchText));
     if (policy.instructions) meta.append(node("span", "", String(policy.instructions).slice(0, 60) + (String(policy.instructions).length > 60 ? "…" : "")));
@@ -3094,26 +3103,56 @@ function createWorkspace(onRequestClose, notifier, services) {
       wrap.append(node("span", "", labelText), control);
       return wrap;
     }
-    function selectField(labelText, options, value, onChange) {
+    function selectField(labelText, options, value, onChange, role) {
       var control = node("select", "dyx-select");
+      var current = value || "";
+      // 以模型值为准记录当前选择：候选项异步到位前 select.value 可能被浏览器置空。
+      control.dataset.current = current;
+      if (role) {
+        control.dataset.role = role;
+        control.dataset.emptyLabel = options[0] && options[0].value === "" ? options[0].label : "";
+      }
+      fillSelectOptions(control, options, current, role);
+      control.addEventListener("change", function () {
+        control.dataset.current = control.value;
+        onChange(control.value);
+      });
+      return field(labelText, control);
+    }
+    function fillSelectOptions(select, options, current, role) {
+      select.textContent = "";
+      if (current && !options.some(function (option) { return option.value === current; })) {
+        var missing = node("option", "", current + (role === "status" ? "（当前项目无此状态）" : role === "members" ? "（当前 ID）" : ""));
+        missing.value = current;
+        missing.selected = true;
+        select.append(missing);
+      }
       options.forEach(function (option) {
         var element = node("option", "", option.label);
         element.value = option.value;
-        if (option.value === value) element.selected = true;
-        control.append(element);
+        if (option.value === current) element.selected = true;
+        select.append(element);
       });
-      control.addEventListener("change", function () { onChange(control.value); });
-      return field(labelText, control);
     }
     function statusNameOptions() {
       return [{ value: "", label: "（不流转）" }].concat((state.defectStatusOptions || []).map(function (item) {
         return { value: item.name, label: item.name };
       }));
     }
-    function memberOptions() {
-      return [{ value: "", label: "（不变更）" }].concat((state.defectMembers || []).map(function (item) {
+    function memberOptions(emptyLabel) {
+      return [{ value: "", label: emptyLabel }].concat((state.defectMembers || []).map(function (item) {
         return { value: item.id, label: item.name };
       }));
+    }
+    // 状态与成员候选是异步拉取的：就绪后就地刷新抽屉里对应的 select 候选项，
+    // 保持模型里的已选值；值不在新候选里时补一个标注项，避免视觉上被静默清空。
+    function refreshOptionLists() {
+      Array.from(dialog.body.querySelectorAll("select[data-role]")).forEach(function (select) {
+        var role = select.dataset.role;
+        var options = role === "status" ? statusNameOptions() : role === "members" ? memberOptions(select.dataset.emptyLabel || "（不变更）") : null;
+        if (!options) return;
+        fillSelectOptions(select, options, select.dataset.current || "", role);
+      });
     }
 
     var head1 = group("触发范围");
@@ -3141,6 +3180,8 @@ function createWorkspace(onRequestClose, notifier, services) {
     });
     kindRow.append(kindWrap);
     head1.append(kindRow);
+    // 负责人筛选：引擎扫描时按该负责人过滤缺陷；留空处理全部。
+    head1.append(selectField("缺陷负责人（只处理该负责人的缺陷，留空不限）", memberOptions("（全部负责人）"), base.trigger.assigneeId, function (value) { base.trigger.assigneeId = value; }, "members"));
     head1.append(numberField("轮询间隔（分钟）", base.trigger.pollMinutes, 1, 1440, function (value) { base.trigger.pollMinutes = value; }));
     head1.append(checkField("处理存量缺陷（启用规则时已存在的也处理）", base.trigger.backfill, function (checked) { base.trigger.backfill = checked; }));
 
@@ -3193,10 +3234,10 @@ function createWorkspace(onRequestClose, notifier, services) {
     head4.append(numberField("改动文件数上限", base.submit.maxChangedFiles, 1, 1000, function (value) { base.submit.maxChangedFiles = value; }));
     head4.append(areaField("禁改路径（glob，命中即转人工）", base.submit.forbiddenPaths, "**/payment/**，.github/**", function (value) { base.submit.forbiddenPaths = value; }));
     head4.append(checkField("结果评论回写到缺陷", base.writeback.comment, function (checked) { base.writeback.comment = checked; }));
-    head4.append(selectField("成功后状态流转到", statusNameOptions(), base.writeback.statusOnSuccess, function (value) { base.writeback.statusOnSuccess = value; }));
-    head4.append(selectField("分析完成后状态流转到（先析后确认）", statusNameOptions(), base.writeback.statusOnConfirm, function (value) { base.writeback.statusOnConfirm = value; }));
-    head4.append(selectField("失败后状态流转到", statusNameOptions(), base.writeback.statusOnFailure, function (value) { base.writeback.statusOnFailure = value; }));
-    head4.append(selectField("失败后改负责人为", memberOptions(), base.writeback.assigneeOnFailure, function (value) { base.writeback.assigneeOnFailure = value; }));
+    head4.append(selectField("成功后状态流转到", statusNameOptions(), base.writeback.statusOnSuccess, function (value) { base.writeback.statusOnSuccess = value; }, "status"));
+    head4.append(selectField("分析完成后状态流转到（先析后确认）", statusNameOptions(), base.writeback.statusOnConfirm, function (value) { base.writeback.statusOnConfirm = value; }, "status"));
+    head4.append(selectField("失败后状态流转到", statusNameOptions(), base.writeback.statusOnFailure, function (value) { base.writeback.statusOnFailure = value; }, "status"));
+    head4.append(selectField("失败后改负责人为", memberOptions("（不变更）"), base.writeback.assigneeOnFailure, function (value) { base.writeback.assigneeOnFailure = value; }, "members"));
 
     var form = node("div", "dyx-policy-form");
     var nameControl = input("text", "规则名称", base.name);
@@ -3220,18 +3261,18 @@ function createWorkspace(onRequestClose, notifier, services) {
       }).then(function () { setBusy(dialog.foot, false); });
     }));
 
-    // 状态名与负责人选项跟随规则绑定的项目；读取失败不阻塞编辑。
+    // 状态名与负责人候选跟随规则绑定的项目；任一就绪后就地刷新下拉，读取失败不阻塞编辑。
     var scopeProjectId = base.scope.projectId || (selectedProject() && selectedProject().id) || "";
     if (scopeProjectId) {
       rpc("defect.statusOptions", rpcArgs({ projectId: scopeProjectId })).then(function (result) {
         state.defectStatusOptions = result.items || [];
-        render();
         if (!dialog.box.isConnected) return;
-        dialog.body.textContent = "";
-        dialog.body.append(node("div", "dyx-note", "匹配顺序 = 规则列表顺序，首个命中的规则生效；保存时宿主会校验 MR 仓库 ID 与回写状态名。"), form);
+        refreshOptionLists();
       }).catch(function () {});
-      rpc("defect.members", rpcArgs({ projectId: scopeProjectId })).then(function (result) {
-        state.defectMembers = result.items || [];
+      rpc("defect.members", rpcArgs({ projectId: scopeProjectId })).then(function (members) {
+        state.defectMembers = Array.isArray(members) ? members : (members && members.items) || [];
+        if (!dialog.box.isConnected) return;
+        refreshOptionLists();
       }).catch(function () {});
     }
   }

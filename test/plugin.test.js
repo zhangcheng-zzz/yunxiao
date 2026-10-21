@@ -1125,6 +1125,9 @@ test("v3 workbench wires the new domains, full-page mode and the policy-driven f
   assert.match(source, /dyx-flow-subtabs/);
   assert.match(source, /旧版画布（只读）/);
   assert.match(source, /renderInboxPage/);
+  // 触发范围支持指定缺陷负责人筛选（引擎扫描按该负责人过滤）。
+  assert.match(source, /缺陷负责人（只处理该负责人的缺陷，留空不限）/);
+  assert.match(source, /policyAssigneeLabel/);
   assert.match(source, /rpc\("code\.repos\.list"/);
   assert.match(source, /rpc\("code\.mrs\.list"/);
   assert.match(source, /rpc\("tests\.plans\.list"/);
