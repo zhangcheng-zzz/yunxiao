@@ -7,6 +7,7 @@ try { ReactRuntime = require("react"); } catch (error) {}
 
 var STYLE_ID = "dsh-yunxiao-style";
 var ROOT_ID = "dsh-yunxiao-root";
+// 初始每页条数占位：各列表页加载前会按工作台可用宽高重算（见 computeGridPageSize）。
 var PAGE_SIZE = 5;
 // 概览页每个聚合卡最多展示的条数（方格网格两行左右），完整列表到对应页签查看。
 var DASHBOARD_PREVIEW_LIMIT = 8;
@@ -131,9 +132,11 @@ var CSS = [
   ".dyx-root,.dyx-root *{box-sizing:border-box}",
   ".dyx-slot-host{width:100%;height:100%;min-height:0}",
   ".dyx-right-panel{position:absolute;inset:0 0 0 auto;width:var(--dyx-workspace-width,480px);min-width:0;overflow:hidden;pointer-events:auto;background:var(--dyx-bg);box-shadow:-12px 0 32px rgba(15,23,42,.08)}",
-  // 全页模式：面板改为 fixed 悬浮，从左侧导航轨右侧一直铺到窗口右缘——
+  // 全页模式：面板改为 fixed 悬浮，从左侧导航轨右侧铺到窗口右缘——
   // 不依赖宿主网格是否可改写，聊天区被整面盖住。
-  ".dyx-right-panel.dyx-panel-full{position:fixed!important;inset:0 0 0 var(--dyx-full-left,280px)!important;width:auto!important;box-shadow:none}",
+  // 上下边界不贴视口，而是锚定宿主内容区（--dyx-full-top/bottom，见 applyPanelWidth），
+  // 避免盖住宿主标题栏——Windows 的窗口控制按钮在标题栏右上角。
+  ".dyx-right-panel.dyx-panel-full{position:fixed!important;top:var(--dyx-full-top,0px)!important;bottom:var(--dyx-full-bottom,0px)!important;left:var(--dyx-full-left,280px)!important;right:0!important;width:auto!important;box-shadow:none}",
   "[data-dyx-workspace-open='true']{grid-template-columns:var(--dyx-sidebar-track,280px) minmax(0,1fr) var(--dyx-workspace-width,480px)!important}[data-dyx-workspace-open='true'] [data-side='details']{left:calc(100% - var(--dyx-workspace-width,480px))!important}",
   ".dyx-resize-handle{position:absolute;z-index:50;inset:0 auto 0 0;width:8px;cursor:col-resize;touch-action:none;outline:0}.dyx-resize-handle::after{content:'';position:absolute;inset:0 auto 0 0;width:2px;background:transparent;transition:background .15s}.dyx-resize-handle:hover::after,.dyx-resize-handle:focus-visible::after,.dyx-resize-handle.active::after{background:var(--dyx-brand)}.dyx-resizing,.dyx-resizing *{cursor:col-resize!important;user-select:none!important}",
   ".dyx-preview-host{position:fixed;inset:12px 12px 12px auto;width:min(520px,calc(100vw - 24px));z-index:2147482500;overflow:hidden;border-radius:12px;box-shadow:var(--dyx-shadow)}",
@@ -1604,17 +1607,44 @@ function createWorkspace(onRequestClose, notifier, services) {
       });
   }
 
-  // 自适应分页：按工作台当前可用宽高估算方格卡片的“列数 × 行数”作为每页条数。
-  // 列宽按卡片最小 330px + 11px 间距估算；行高按卡片约 130px + 11px 间距估算；
-  // 高度预留页头/统计条/筛选栏/分页条；结果钳制在 4–100（服务端上限 100）。
+  // 自适应分页：按工作台当前可用宽高估算网格卡片的“列数 × 行数”作为每页条数。
+  // 列距按网格最小列宽 + 11px 间距估算；行距按单张卡片高度 + 间距估算；
+  // 高度预留页头/统计条/筛选栏/分页条；结果钳制在 4 与服务端每页上限之间。
+  function computeGridPageSize(listWidth, columnPitch, rowPitch, maxPageSize) {
+    var viewportHeight = window.innerHeight || 900;
+    var columns = Math.max(1, Math.floor((listWidth + 11) / columnPitch));
+    var availableHeight = Math.max(300, viewportHeight - 330);
+    var rows = Math.max(1, Math.floor(availableHeight / rowPitch));
+    return Math.min(maxPageSize, Math.max(4, columns * rows));
+  }
+
+  // 缺陷页双栏时右侧通知栏占 300 + 14 间距；缺陷方格最小 330px 宽、约 130px 高。
   function computeDefectPageSize() {
     var containerWidth = (main && main.clientWidth) || 1200;
-    var viewportHeight = window.innerHeight || 900;
     var listWidth = containerWidth >= 920 ? containerWidth - 314 : containerWidth; // 双栏时右侧通知栏占 300 + 14 间距
-    var columns = Math.max(1, Math.floor((listWidth + 11) / 341));
-    var availableHeight = Math.max(300, viewportHeight - 330);
-    var rows = Math.max(1, Math.floor(availableHeight / 141));
-    return Math.min(100, Math.max(4, columns * rows));
+    return computeGridPageSize(listWidth, 341, 141, 100);
+  }
+
+  // 流水线/代码/测试/制品页网格整栏铺满，方格最小 288px 宽；
+  // 流水线卡约 130px 高，代码/测试/制品卡多一行 meta 约 154px 高。
+  // 服务端每页上限：流水线接口 30，其余 100。
+  function adaptivePageSizeFor(tab) {
+    if (tab === "pipelines") return { pageState: state.pipelines, reload: loadPipelines, rowPitch: 141, maxPageSize: 30 };
+    if (tab === "code") return { pageState: state.code, reload: loadCodeRepos, rowPitch: 165, maxPageSize: 100 };
+    if (tab === "tests") return { pageState: state.tests, reload: loadTestPlans, rowPitch: 165, maxPageSize: 100 };
+    if (tab === "packages") return { pageState: state.packages, reload: loadPackageRepos, rowPitch: 165, maxPageSize: 100 };
+    return null;
+  }
+
+  // 请求前同步每页条数：可用宽高变化导致条数变化时回到第一页重新查询。
+  function applyAdaptivePageSize(tab) {
+    var adaptive = adaptivePageSizeFor(tab);
+    if (!adaptive) return false;
+    var desired = computeGridPageSize((main && main.clientWidth) || 1200, 299, adaptive.rowPitch, adaptive.maxPageSize);
+    if (desired === adaptive.pageState.pageSize) return false;
+    adaptive.pageState.pageSize = desired;
+    adaptive.pageState.page = 1;
+    return true;
   }
 
   function loadDefects() {
@@ -2117,6 +2147,7 @@ function createWorkspace(onRequestClose, notifier, services) {
 
   function loadPipelines() {
     if (!selectedProject()) return render();
+    applyAdaptivePageSize("pipelines");
     setBusy(main, true);
     rpc("pipelines.list", rpcArgs({ page: state.pipelines.page, pageSize: state.pipelines.pageSize, keyword: state.pipelineKeyword })).then(function (result) {
       state.pipelines = result; render();
@@ -2404,6 +2435,7 @@ function createWorkspace(onRequestClose, notifier, services) {
   // —— 代码 Codeup：仓库列表 + 分支 / 合并请求 ————————————————————————————
   function loadCodeRepos() {
     if (!selectedProject()) { state.code.loaded = true; render(); return; }
+    applyAdaptivePageSize("code");
     return rpc("code.repos.list", rpcArgs({ page: state.code.page, pageSize: state.code.pageSize, search: state.code.keyword })).then(function (result) {
       state.code.repos = result.items || [];
       state.code.total = result.total || state.code.repos.length;
@@ -2600,6 +2632,7 @@ function createWorkspace(onRequestClose, notifier, services) {
   // —— 测试管理 / 制品仓库 ————————————————————————————————————————————
   function loadTestPlans() {
     if (!selectedProject()) { state.tests.loaded = true; render(); return; }
+    applyAdaptivePageSize("tests");
     return rpc("tests.plans.list", rpcArgs({ page: state.tests.page, pageSize: state.tests.pageSize })).then(function (result) {
       state.tests.plans = result.items || [];
       state.tests.total = result.total || state.tests.plans.length;
@@ -2690,6 +2723,7 @@ function createWorkspace(onRequestClose, notifier, services) {
 
   function loadPackageRepos() {
     if (!selectedProject()) { state.packages.loaded = true; render(); return; }
+    applyAdaptivePageSize("packages");
     return rpc("packages.repos.list", rpcArgs({ page: state.packages.page, pageSize: state.packages.pageSize })).then(function (result) {
       state.packages.repos = result.items || [];
       state.packages.total = result.total || state.packages.repos.length;
@@ -3725,12 +3759,16 @@ function createWorkspace(onRequestClose, notifier, services) {
         startFlowsPolling();
       }
     }).catch(function (error) { toast(error.message, true); });
-    // 视口尺寸变化：缺陷页每页条数按新宽高重算（防抖 350ms），变化时重新加载列表。
+    // 视口尺寸变化：当前列表页每页条数按新宽高重算（防抖 350ms），变化时重新加载列表。
     onViewportResize = function () {
-      if (state.tab !== "defects" || !selectedProject()) return;
       window.clearTimeout(defectResizeTimer);
       defectResizeTimer = window.setTimeout(function () {
-        if (state.tab === "defects" && selectedProject() && computeDefectPageSize() !== state.defects.pageSize) loadDefects();
+        if (!selectedProject()) return;
+        if (state.tab === "defects") {
+          if (computeDefectPageSize() !== state.defects.pageSize) loadDefects();
+          return;
+        }
+        if (applyAdaptivePageSize(state.tab)) adaptivePageSizeFor(state.tab).reload();
       }, 350);
     };
     window.addEventListener("resize", onViewportResize);
@@ -4199,6 +4237,13 @@ function apply(ctx) {
       // 全页模式下面板改为 fixed 悬浮（覆盖中间聊天区），左侧从宿主导航轨右缘开始。
       activePanelElement.classList.toggle("dyx-panel-full", FULL_MODE_ACTIVE);
       activePanelElement.style.setProperty("--dyx-full-left", HOST_SIDEBAR_TRACK + "px");
+      // fixed 面板若上下贴到视口边缘，会盖住宿主标题栏——Windows 的窗口控制按钮
+      // （最小化/最大化/关闭）正在标题栏右上角，与本面板头部的 ⤡/× 冲突。
+      // 因此上下边界锚定宿主 overlay（即宿主内容区）的实际位置，全页只在内容区内铺满。
+      var hostArea = activePanelElement.closest("[data-shell-overlay]") || activePanelElement.parentElement;
+      var hostRect = hostArea.getBoundingClientRect();
+      activePanelElement.style.setProperty("--dyx-full-top", Math.max(0, Math.round(hostRect.top)) + "px");
+      activePanelElement.style.setProperty("--dyx-full-bottom", Math.max(0, Math.round(window.innerHeight - hostRect.bottom)) + "px");
     }
     if (persist) {
       preferredPanelWidth = panelWidth;
